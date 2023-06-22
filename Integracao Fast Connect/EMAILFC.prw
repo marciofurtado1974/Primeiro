@@ -29,6 +29,7 @@ Return
 User Function EMALFCRE
 	// area atual
 	local _aAreaZ06 := Z06->(GetArea())
+	local githubis  := "teste atualiza git"
 
 	If Z06->Z06_STATUS != "P"
 
