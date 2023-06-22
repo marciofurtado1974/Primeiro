@@ -1,0 +1,154 @@
+#Include "TOTVS.ch"
+#Include 'Protheus.ch'
+#Include 'TopConn.ch'
+
+/*/{Protheus.doc} SCHCONRP
+    Schedule para consultas de repasses de títulos da FastConnect (contingência)
+		O repasse é enviado para o endpoint interno para reuso da função, 
+		pois o repasse via webhook permanece executando
+    @type function
+    @version 1.0
+    @author Daniel Scheeren - Gruppe
+    @since 20/02/2023
+    /*/
+User Function SCHCONRP(aParams)
+
+    Local _cLockFile 	 := ""
+    // Local _nHdlJob   := 0
+	Local lJob		 	 := IsBlind()
+	// verifica se é base teste ou produção para alterar endpoints
+    Local lBaseProducao  := Upper(AllTrim(GetSrvProfString("dbalias", ""))) == "SIGAPROD"
+
+	Default aParams 	 := {"04", "01"}
+	
+	Private cHost 		 := ""
+	Private cToken		 := ""
+	Private cCliToken    := ""
+	Private cPath 		 := "/venda/recebidos?data_conciliacao="
+	Private aHeader      := {}
+	Private cHostKhronos := ""
+
+	If lJob
+		// prepara ambiente
+		RpcSetType(3)
+		RpcSetEnv(aParams[1], aParams[2],,,,,,,,,)
+	EndIf
+
+	// dados da produção
+	If lBaseProducao
+		cHost		 := "https://api.fpay.me"
+		cHostKhronos := "http://erp.grupokhronos.com.br:9090/rest"
+		cToken	   := SuperGetMV("MV_TOKENFC", .F., "")
+		cCliToken  := SuperGetMV("MV_CLICOFC", .F., "")
+	Else
+		cHost		 := "https://api-sandbox.fpay.me"
+		cHostKhronos := "http://erp.grupokhronos.com.br:9093/rest"
+		cToken		 := "6ea297bc5e294666f6738e1d48fa63d2"
+		cCliToken	 := "FC-SB-15" 
+	EndIf
+	
+	// cabeçalho de requisição
+	aAdd(aHeader, "Content-Type: application/json")
+	aAdd(aHeader, "Client-Code: " + cCliToken)
+	aAdd(aHeader, "Client-key: " + cToken)
+
+    // Montagem do arquivo do job principal
+	_cLockFile := Lower("SCHCONRP" + FwCodEmp() + FwCodFil())// + ".lck"
+    
+    // verifica se o JOB esta em execucao
+	If GlbNmLock(_cLockFile)
+
+		If lJob
+			ConsultaRepasses()
+		Else
+			Processa({|| ConsultaRepasses() }, "Processando...")
+		EndIf
+
+		GlbNmUnlock(_cLockFile)
+
+	Else
+		Conout("[SCHCONRP] - Não conseguiu lock.")
+	EndIf
+
+	If lJob
+		RpcClearEnv()
+	EndIf
+
+Return Nil
+
+
+/*/{Protheus.doc} ConsultaRepasses
+	Efetua consulta no endpoint de repasses
+	@type function
+	@version 1.0
+	@author Daniel Scheeren - Gruppe
+	@since 20/02/2023
+	@return variant, return_description
+	/*/
+Static Function ConsultaRepasses()
+	
+	Local aArea   	   := GetArea()
+	Local nX
+	Local oRest   	   := FWRest():New(cHost)
+	Local oRestBoletos
+	// formata parametro de data
+	Local cDataPesq    := Transform(DToS(Date()), "@R 9999-99-99")
+	Local jJsonBoletos := JsonObject():New()
+	Local nBegin 	   := Seconds()
+
+	// path consutla credito
+	oRest:SetPath(cPath + cDataPesq)
+
+	oRest:SetChkStatus(.T.)
+
+	FwLogMsg("INFO", /*cTransactionId*/, "FASTCNNECT", "SCHCONRP", "", "01", "Iniciando consulta de repasses para: " + cDataPesq, 0, (Seconds() - nBegin), {})
+
+	// tenta efetuar o Get
+	If oRest:Get(aHeader)
+
+		// resgata a resposta do JSON
+		jJsonBoletos:FromJson(DecodeUTF8(oRest:GetResult()))
+
+		// encontrou repasses
+		If jJsonBoletos:HasProperty('data') .and. !Empty(jJsonBoletos:GetJsonObject('data'))
+
+			FwLogMsg("INFO", /*cTransactionId*/, "FASTCNNECT", "SCHCONRP", "", "01", "Iniciando envio de repasses.", 0, (Seconds() - nBegin), {})
+					
+			jJsonBoletos := jJsonBoletos['data']
+
+			For nX := 1 To Len(jJsonBoletos)
+
+				FwLogMsg("INFO", /*cTransactionId*/, "FASTCNNECT", "SCHCONRP", "", "02", "Repasse " + cValToChar(nX) + "/" + cValToChar(Len(jJsonBoletos)), 0, (Seconds() - nBegin), {})
+
+				// boleto ou credito
+				cTipoTitulo := Lower(jJsonBoletos[nX]["tipo"])
+
+				oRestBoletos := FWRest():New(cHostKhronos)
+
+				// path consutla credito
+				oRestBoletos:SetPath("/pagamento/" + cTipoTitulo)
+
+				// json com os dados de envio
+				oRestBoletos:SetPostParams("body")
+				oRestBoletos:SetPostParams(jJsonBoletos[nX]:ToJson())
+				oRestBoletos:SetChkStatus(.T.)
+
+				// tenta efetuar o Post
+				If oRestBoletos:Post(aHeader)
+
+					jJsonBoleto := JsonObject():New()
+					// resgata a resposta do JSON
+					jJsonBoleto:FromJson(DecodeUTF8(oRestBoletos:GetResult()))
+
+				EndIf
+				
+			Next
+
+		EndIf
+	EndIf
+
+	FwLogMsg("INFO", /*cTransactionId*/, "FASTCNNECT", "SCHCONRP", "", "03", "Finalizado envio de repasses.", 0, (Seconds() - nBegin), {})
+
+	RestArea(aArea)
+
+Return Nil

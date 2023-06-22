@@ -1,0 +1,253 @@
+#include "Tlpp-Core.th"
+#include "Tlpp-Rest.th"
+#include "Protheus.ch"
+
+#Define WS_ENDPOINT 		"/link/?nu_link="
+
+/*/{Protheus.doc} WsFCCancelarPgtoCC
+    Integração de cancelamento de títulos de cartão de crédito com a FastConnect
+    @type function
+    @version 1.0
+    @author Daniel Scheeren - Gruppe
+    @since 15/10/2021
+    /*/
+User Function WsFCCancelarPgtoCC()
+
+	Local aHeader		:= {}				as array
+	Local _lRetOk		:= .T. 				as logical
+	Local oRest								as object
+	Local oRestDelete						as object
+	Local jJson								as json
+	Local jJsonRet							as json
+	Local aDadosLog		:= {"","","","",""}	as array
+	Local nX
+	Local aCCCancelados := {}				as array
+	Local cPathLink 	:= "/link/?nu_link="
+	Local cPathLinkDel 	:= "/link/"
+	Local cPathVenda 	:= "/credito/"
+	Local lVenda		:= .F.
+
+	// busca títulos de cobranças de cartão de crédito
+	_cQuery := " SELECT E1_NUM "
+	_cQuery += " 		,E1_PREFIXO "
+	_cQuery += " 		,E1_PARCELA "
+	_cQuery += " 		,E1_CLIENTE "
+	_cQuery += " 		,E1_LOJA "
+	_cQuery += " 		,E1_TIPO "
+	_cQuery += " 		,E1_SALDO "
+	_cQuery += " 		,Z05_IDFAST AS FID "
+	_cQuery += " 		,SE1.R_E_C_N_O_ AS RECNO "
+	_cQuery += " FROM " + RetSQLTab("SE1")
+	_cQuery += " 			INNER JOIN " + RetSQLTab("Z05")
+	_cQuery += " 			ON Z05_TITULO = E1_NUM "
+	_cQuery += " 			AND Z05_PREFIX = E1_PREFIXO "
+	_cQuery += " 			AND Z05_CLIENT = E1_CLIENTE "
+	_cQuery += " 			AND Z05_LOJA   = E1_LOJA "
+	_cQuery += " 			AND Z05_PARCEL = E1_PARCELA "
+	_cQuery += " 			AND " + RetSQLCond("Z05")
+	_cQuery += " WHERE E1_FILIAL = '" + FWxFilial("SE1") + "' "
+	// filtra o título deletado, pois na exclusão ocorre a deleção do registro e somente é enviado para a Fast posteriormente via schedule
+	// _cQuery += " AND SE1.D_E_L_E_T_ <> '' "
+	// pagamento via cartão de crédito
+	// _cQuery += " AND TRIM(E1_TIPO) = 'CC' "
+	// somente pendentes de cancelamento (E1_ZSTATFC = 'P' e Z05_CANCEL = 'T')
+	_cQuery += " AND E1_ZSTATFC = 'C' "
+	// cancelado
+	// _cQuery += " AND Z05_CANCEL = 'T'"
+	// verifica se título veio de contrato e verifica o tipo de pagamento pelo contrato
+	_cQuery += " AND (CASE WHEN TRIM(E1_TIPO) = 'NF' AND TRIM(E1_CONTKHR) <> ' ' "
+	_cQuery += " 		THEN  "
+	// busca o contrato e verifica a forma de pagamento se é CC
+	_cQuery += " 			(CASE WHEN (SELECT TRIM(ZC_FORMA) FROM " + RetSQLTab("SZC") + " WHERE " + RetSQLCond("SZC") + " AND ZC_NUM = E1_CONTKHR) = 'CC' THEN 1 ELSE 0 END) "
+	// verifica se for título de CC e não possui contrato também envia
+	_cQuery += " 		WHEN TRIM(E1_TIPO) = 'CC' AND TRIM(E1_CONTKHR) IS NULL "
+    _cQuery += "			THEN 1 "
+	_cQuery += " 		ELSE 0 "
+	_cQuery += " 		END) = 1 "
+	_cQuery += " GROUP BY E1_NUM, E1_PREFIXO, E1_CLIENTE, E1_LOJA, E1_PARCELA, E1_TIPO, E1_SALDO, Z05_IDFAST, SE1.R_E_C_N_O_ "
+
+	// em array, pois tabela temporária não exibe deletados
+	aCCCancelados := U_SQLToVet(_cQuery)
+	
+	If !Empty(aCCCancelados)
+
+		// grava log
+		Conout("Iniciado processo de cancelamento de cobrança de crédito. - [WsFCCancelarPgtoCC]")
+
+		// grava log
+		// U_FCLog("CC", aDadosLog, "Quantidade de cobrança(s) de crédito a serem cancelados: " + cValToChar(Len(aCCCancelados)))
+		
+		// cabeçalho de requisição
+		aAdd(aHeader, "Content-Type: application/json")
+		aAdd(aHeader, "Client-Code: " + CLIENT_CODE)
+		aAdd(aHeader, "Client-key: " + TOKEN)
+
+		For nX := 1 To Len(aCCCancelados)
+
+			// dados do título para gravação do log
+			aDadosLog := {;
+				aCCCancelados[nX, 1],;
+				aCCCancelados[nX, 2],;
+				aCCCancelados[nX, 3],;
+				aCCCancelados[nX, 4],;
+				aCCCancelados[nX, 5],;
+				aCCCancelados[nX, 6];
+			}
+
+			// ID do link ou venda
+			nSaldoTitulo := aCCCancelados[nX, 7]
+
+			// ID do link ou venda
+			cIDFastConnect := AllTrim(aCCCancelados[nX, 8])
+
+			// recno para acessar o registro para atualização do status, visto que está deletado
+			nRecnoSE1 := aCCCancelados[nX, 9]
+
+			// verifica se é uma venda ou link
+			// se é um UUID, significa que o link virou uma venda
+			// se for somente numérico ainda é somente um link
+			lVenda := At("-", cIDFastConnect) > 0
+
+			// endereço da integração
+			oRest	:= FWRest():New(HOST)
+
+			If lVenda
+				oRest:SetPath(cPathVenda + cIDFastConnect)
+			Else
+				oRest:SetPath(cPathLink + cIDFastConnect)
+			EndIf
+
+			// json com os dados de envio
+			oRest:SetChkStatus(.T.)
+
+			// verifica  o status do título para efetuar o delete
+			If oRest:Get(aHeader)
+
+				// resgata a resposta do JSON
+				jJson := JsonObject():New()
+				jJson:FromJson(DecodeUTF8(oRest:GetResult()))
+				
+				// valida se obteve sucesso na busca
+				If jJson['success'] .and. jJson:HasProperty("data")
+				
+					// se foi um link cancela, se for venda valida se o título já não esta cancelado ou pago
+					If (!lVenda .and. Len(jJson['data']) > 0) .or. (lVenda .and. !(Upper(jJson['data']["situacao"]) == "CANCELADO") .and. !(Upper(jJson['data']["situacao"]) == "PAGO"))
+
+						// endereço da integração
+						oRestDelete	:= FWRest():New(HOST)
+
+						If lVenda
+							oRestDelete:SetPath(cPathVenda + cIDFastConnect)
+						Else
+							oRestDelete:SetPath(cPathLinkDel + cIDFastConnect)
+						EndIf
+
+						// json com os dados de envio
+						oRestDelete:SetChkStatus(.T.)
+
+						// tenta efetuar o Post
+						If oRestDelete:Delete(aHeader)
+
+							jJson    := JsonObject():New()
+							jJsonRet := JsonObject():New()
+
+							// Resgata a resposta do JSON
+							jJson:FromJson(DecodeUTF8(oRestDelete:GetResult()))
+
+							// recebe o retorno
+							_lRetOk  := jJson['success']
+
+							// dados de retorno
+							jJsonRet:FromJson(AllTrim(jJson['data']:ToJson()))
+							
+							// verifica se houve baixa manual do título, então altera status
+							If nSaldoTitulo == 0
+								cStatusIntg := "B"
+							Else
+								cStatusIntg := "X"
+							EndIf
+							// tabela de integração de título x fastconnect
+							U_FCGravaDadosRetorno("credito", aDadosLog, jJsonRet, _lRetOk, Nil, nRecnoSE1, cStatusIntg)
+							
+							// grava log
+							U_FCLog("CC", aDadosLog, "Sucesso no cancelamento da cobrança de crédito.", "X", "", jJsonRet, "")
+						Else
+							jJsonRet := JsonObject():New()
+							_lRetOk  := .F.
+
+							// Resgata a resposta do JSON
+							jJsonRet:FromJson(AllTrim(oRestDelete:GetResult()))
+
+							// código de erro
+							cErro := "[" + DecodeUTF8(AllTrim(oRestDelete:GetLastError())) + "]"
+
+							// extrai mensagens do json de retorno
+							cErro += U_FCFormataErrosRetorno(jJsonRet)
+
+							// tabela de integração de título x fastconnect
+							U_FCGravaDadosRetorno("credito", aDadosLog, jJsonRet, _lRetOk, .T., Nil, "C")
+							
+							// grava log
+							U_FCLog("CC", aDadosLog, "Erro no cancelamento da cobrança de crédito.", "E", "", jJsonRet, cErro)
+						EndIf
+
+					// se estiver pago e por algum motivo esta tentando cancelá-lo, volta status de pago
+					ElseIf (!lVenda .and. Len(jJson['data']) > 0) .or. (lVenda .and. Upper(jJson['data']["situacao"]) == "PAGO")
+
+						// verifica se houve baixa manual do título, então altera status
+						If nSaldoTitulo == 0
+							cStatusIntg := "B"
+						Else
+							cStatusIntg := "T"
+						EndIf
+
+						// tabela de integração de título x fastconnect
+						U_FCGravaDadosRetorno("credito", aDadosLog, jJson['data'], .T., Nil, nRecnoSE1, cStatusIntg)
+						
+						// grava log
+						U_FCLog("CC", aDadosLog, "Título já se encontra pago. Não é possível cancelá-lo.", cStatusIntg, "", jJson['data'], "")
+
+					Else
+
+						// verifica se houve baixa manual do título, então altera status
+						IF nSaldoTitulo == 0
+							cStatusIntg := "B"
+						Else
+							cStatusIntg := "X"
+						EndIf
+
+						// tabela de integração de título x fastconnect
+						U_FCGravaDadosRetorno("credito", aDadosLog, If(Len(jJson['data']) > 0, jJson['data'], jJson), .T., Nil, nRecnoSE1, cStatusIntg)
+						
+						// grava log
+						U_FCLog("CC", aDadosLog, "Título já cancelado anteriormente.", "C", "", If(Len(jJson['data']) > 0, jJson['data'], jJson), "")
+					EndIf
+				// erro no retorno da consulta
+				Else
+					jJson    := JsonObject():New()
+					jJsonRet := JsonObject():New()
+
+					// resgata a resposta do JSON
+					jJson:FromJson(DecodeUTF8(oRest:GetResult()))
+
+					// dados de retorno
+					jJsonRet:FromJson(AllTrim(jJson['data']:ToJson()))
+
+					// grava log
+					U_FCLog("CC", aDadosLog, "Houve um erro na consulta do título para cancelamento.", "X", "", jJsonRet, "")
+				EndIf
+			Else
+				// Resgata a resposta do JSON
+				jJsonRet := JsonObject():New()
+				jJsonRet:FromJson(AllTrim(oRest:GetResult()))
+
+				U_FCLog("CC", aDadosLog, "Título ainda não está disponível para cancelamento.", "A", "", jJsonRet)
+			EndIf
+		Next
+	
+		// grava log
+		U_FCLog("CC", {"","","","",""}, "Finalizado processo de cancelamento de cobrança(s) de crédito.")
+
+	EndIf
+
+Return Nil

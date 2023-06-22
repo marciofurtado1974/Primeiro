@@ -1,0 +1,277 @@
+#Include 'Protheus.ch'
+#Include 'TopConn.ch'
+
+/*/{Protheus.doc} SCHBXFST
+    Schedule para baixa de títulos repassados pela FastConnect
+    @type function
+    @version 1.0
+    @author Daniel Scheeren - Gruppe
+    @since 14/07/2022
+    /*/
+User Function SCHBXFST(aParams)
+
+    Local _cLockFile := ""
+    Local _nHdlJob   := 0
+	Local lJob		 := IsBlind()//FWGetRunSchedule()
+
+	Default aParams := {"04", "01"}
+
+	If lJob
+		// prepara ambiente
+		RpcSetType(3)
+		RpcSetEnv(aParams[1], aParams[2],,,,,,,,,)
+	EndIf
+	
+    Conout("[SCHBXFST] - Iniciado baixa automática de títulos Fast Connect.")
+
+    // Montagem do arquivo do job principal
+	_cLockFile := Lower("SCHBXFST" + cEmpAnt + cFilAnt) + ".lck"
+    
+    // verifica se o JOB esta em execucao
+	If ! JobIsRunning(_cLockFile)
+
+		// inicia execucao e controle do JOB
+		_nHdlJob := JobSetRunning(_cLockFile, .T.)
+		
+		// se conseguiu acesso exclusivo
+		If _nHdlJob >= 0
+
+            // GrvDadosRetroativo()
+
+			// seleciona e efetua baixa de títulos
+			SelecionaRepassesDoDia()
+
+		EndIf
+
+		// Libera o Lock
+		JobSetRunning(_cLockFile, .F., _nHdlJob)
+
+	Else
+		Conout("[SCHBXFST] - Não conseguiu lock.")
+	EndIf
+
+	If lJob
+		RpcClearEnv()
+	EndIf
+
+Return Nil
+
+
+
+
+/*/{Protheus.doc} SelecionaRepassesDoDia
+	Seleciona os repasses do dia e gera baixa
+	@type function
+	@version 1.0
+	@author Daniel Scheeren - Gruppe
+	@since 15/07/2022
+	@return variant, return_description
+	/*/
+Static Function SelecionaRepassesDoDia()
+
+    Local aDadosLog   := {}
+    Local cTipoTitulo := ""
+    Local cChave      := ""
+    Local nPos        := 1
+    Local nTamEmp     := If(!Empty(cEmpAnt), Len(cEmpAnt), 2)
+    Local nTamFil     := If(!Empty(cFilAnt), Len(cFilAnt), 2)
+    Local cQuery      := ""
+    Local cTmpAlias   := GetNextAlias()
+	
+	If Select(cTmpAlias) > 0
+        (cTmpAlias)->(DbCloseArea())
+    EndIf
+
+    cQuery := " SELECT * FROM " + RetSqlTab("Z08")
+    cQuery += " WHERE " + RetSqlCond("Z08")
+    // cQuery += " AND Z08_DATA = '" + DToS(Date()) + "' "
+    cQuery += " AND Z08_STATUS IN ('P', 'E') "
+
+    // cQuery := " select * from " + RetSqlTab("Z08")
+    // cQuery += "                     inner join " + RetSqlTab("SE1")
+    // cQuery += "                     on " + RetSqlCond("SE1")
+    // cQuery += "                     and e1_num = z08_titulo
+    // cQuery += "                     and e1_prefixo = z08_prefix
+    // cQuery += "                     and e1_parcela = z08_parcel
+    // cQuery += "                     and e1_cliente = z08_client
+    // cQuery += "                     and e1_loja = z08_loja
+    // cQuery += "                     and e1_saldo > 0
+    // cQuery += "                     and e1_tipo = 'IS-'
+    // cQuery += " where " + RetSqlCond("Z08")
+    // // cQuery += " and z08_status <> 'E' "
+    // // cQuery += " and z08_mensag = 'Erro na baixa do título: AJUDA:VALORMAIORValor digitado maior do que o valor     pendente no título.                                                                                                                                                          ' "
+    // cQuery += " order by z08_titulo, z08_prefix "
+
+    cQuery := ChangeQuery(cQuery)
+	DbUseArea(.T., 'TOPCONN', TCGENQRY(,,cQuery), (cTmpAlias), .F., .T.)
+
+    // repasses do dia
+    While !(cTmpAlias)->(Eof())
+
+        DbSelectArea("Z08")
+        Z08->(DbSetOrder(1))    // 1- Z08_FILIAL, Z08_TITULO, Z08_PREFIX, Z08_PARCEL, Z08_CLIENT, Z08_LOJA, Z08_TIPTIT
+        Z08->(DbSeek(FWxFilial("Z08") + (cTmpAlias)->Z08_TITULO + (cTmpAlias)->Z08_PREFIX + (cTmpAlias)->Z08_PARCEL + (cTmpAlias)->Z08_CLIENT + (cTmpAlias)->Z08_LOJA + (cTmpAlias)->Z08_TIPTIT))
+
+        // status Pendente ou Erro e maximo 5 tentativas
+        // If Z08->Z08_STATUS $ "P-E" .and. Z08->Z08_TRY <= 5
+        If Z08->Z08_TRY <= 5
+
+            nPos      := 1
+            aDadosLog := {}
+            cTpTitulo := AllTrim(Z08->Z08_TIPTIT)	// Tipo do título (BOL=Boleto, CC=Cartão de crédito)
+            jJson     := JsonObject():New()
+            jJson:FromJson(Z08->Z08_JSON)
+
+            // tipo do título
+            cTipoTitulo := If(cTpTitulo == "CC", "credito", "boleto")
+            // chave do título
+            cChave      := SubStr(AllTrim(Z08->Z08_CODREF), (nTamEmp + nTamFil + 1))
+            
+            // dados do título para gravação do log
+            // Num Título
+            Aadd(aDadosLog, SubStr(cChave, nPos, TamSX3("E1_NUM")[1]))
+            nPos         += Len(aDadosLog[1])
+            // Prefixo
+            Aadd(aDadosLog, SubStr(cChave, nPos, TamSX3("E1_PREFIXO")[1]))
+            nPos         += Len(aDadosLog[2])
+            // Parcela
+            Aadd(aDadosLog, SubStr(cChave, nPos, TamSX3("E1_PARCELA")[1]))
+            nPos         += Len(aDadosLog[3])
+            // Cliente
+            Aadd(aDadosLog, SubStr(cChave, nPos, TamSX3("E1_CLIENTE")[1]))
+            nPos         += Len(aDadosLog[4])
+            // Loja
+            Aadd(aDadosLog, SubStr(cChave, nPos, TamSX3("E1_LOJA")[1]))
+            nPos         += Len(aDadosLog[5])
+            // Tipo
+            Aadd(aDadosLog, SubStr(cChave, nPos, TamSX3("E1_TIPO")[1]))
+            nPos         += Len(aDadosLog[6])
+
+            // exlui baixa do título
+            // aBaixa := {{"E1_PREFIXO"  	,aDadosLog[2]				,Nil},;
+            //             {"E1_NUM"      	,aDadosLog[1]  					,Nil},;
+            //             {"E1_PARCELA"  	,aDadosLog[3]				,Nil},;
+            //             {"E1_TIPO"     	,aDadosLog[6]  					,Nil}}
+            
+            // lMsErroAuto := .F.
+            
+            // MSExecAuto({|x,y| Fina070(x,y)}, aBaixa, 6) // 3 - Baixa de Título, 5 - Cancelamento de baixa, 6 - Exclusão de Baixa
+
+            // If lMsErroAuto
+            //     DisarmTransaction()
+            //     MostraErro()
+            //     // cancela operação
+            //     lRet := .F.
+            // EndIf
+
+
+            // tabela de integração de título x fastconnect
+            U_FCGravaDadosRetorno(cTipoTitulo, aDadosLog, jJson, .T., Nil, Nil, "B")  // B=Baixado/Pago
+            
+            // grava log
+            U_FCLog(cTpTitulo, aDadosLog, "Processado baixa automatica de " + If(cTpTitulo == "CC", "cobrança de crédito", "boleto") + ".", "B", "", jJson, "")
+        
+        EndIf
+
+        (cTmpAlias)->(DbSkip())
+    End
+
+    If Select(cTmpAlias) > 0
+        (cTmpAlias)->(DbCloseArea())
+    EndIf
+
+Return Nil
+
+
+/*/{Protheus.doc} GrvNumFstRetroativo
+	Grava de numero da Fast Connect para títulos retroativos
+	@type function
+	@version 1.0
+	@author Daniel Scheeren - Gruppe
+	@since 01/02/2022
+	@return variant, return_description
+	/*/
+Static Function GrvDadosRetroativo()
+	
+	DbSelectArea("Z08")
+    While !Z08->(Eof())
+
+        nValMulta := 0
+        nValJuros := 0
+        jJsonRetorno := JsonObject():New()
+
+        // resgata a resposta do JSON
+        jJsonRetorno:FromJson(Z08->Z08_JSON)
+
+        // If Empty(Z08->Z08_DTREPA)
+
+        //     DbSelectArea("Z04")
+        //     Z04->(DbSetOrder(1))	// 1 - Z0 _FILIAL, Z0 _TITULO, Z0 _PREFIX, Z0 _PARCEL, Z0 _CLIENT, Z0 _LOJA
+        //     If Z04->(DbSeek(FWxFilial("Z04") + Z08->Z08_TITULO + Z08->Z08_PREFIX + Z08->Z08_PARCEL + Z08->Z08_CLIENT + Z08->Z08_LOJA))
+                
+        //         If Z08->Z08_VLREPA == 0
+        //             // incrementa tentativa
+        //             RecLock("Z08", .F.)
+        //                 Z08->Z08_DTREPA := SToD(SubStr(StrTran(jJsonRetorno["dt_recebimento"], "-", ""), 1, 8))
+        //                 Z08->Z08_VLREPA := Val(jJsonRetorno["vl_venda"])
+        //                 Z08->Z08_VLRJUR := Val(jJsonRetorno["vl_juros"])
+        //                 Z08->Z08_VLRMUL := Val(jJsonRetorno["vl_multa"])
+        //                 Z08->Z08_CODREF := Z04->Z04_CODREF
+        //             MsUnlock()
+        //         EndIf
+        //     EndIf
+        // EndIf
+
+        DbSelectArea("SE1")
+        SE1->(DbSetOrder(2))	// 1 - E1_FILIAL, E1_CLIENTE, E1_LOJA, E1_PREFIXO, E1_NUM, E1_PARCELA, E1_TIPO
+        If SE1->(DbSeek(FWxFilial("SE1") + Z08->Z08_CLIENT + Z08->Z08_LOJA + Z08->Z08_PREFIX + Z08->Z08_TITULO + Z08->Z08_PARCEL))
+
+            // data do pagamento
+            dDataBaixa := SToD(SubStr(StrTran(jJsonRetorno["dt_pagamento"], "-", ""), 1, 8))
+            // valor repasssado pela fast (sem valor da taxa da fast)
+            nValorReceb  := Val(jJsonRetorno['vl_recebido'])
+            // valor da venda enviada á Fast (total)
+            nValorTotFast   := Val(jJsonRetorno['vl_venda'])
+
+            // valor retido pela fast pela taxa cobrada
+            nValorTaxa := U_FCCalcVlrTaxa(nValorTotFast, Z08->Z08_TIPTIT)
+
+            // valor pago após vencimento
+            If dDataBaixa > SE1->E1_VENCREA
+
+                // valor de juros e multa
+                If jJsonRetorno:HasProperty('vl_juros')
+                    nValJuros := Val(jJsonRetorno["vl_juros"])
+
+                    // verifica se o valor repassado menos o valor de taxa da fast 
+                    If nValJuros == 0 .and. ((nValorReceb + nValorTaxa) - nValorTotFast) > 0
+                        // valor de juros + multa
+                        nVlrSobra := ((nValorReceb + nValorTaxa) - nValorTotFast)
+                        nValMulta := Round(nValorTotFast * 0.02, 2)   // calcula 2% de multa
+                        nValJuros := nVlrSobra - nValMulta
+                    EndIf
+                EndIf
+                If jJsonRetorno:HasProperty('vl_multa') .and. nValMulta == 0
+                    nValMulta := Val(jJsonRetorno["vl_multa"])
+                EndIf
+
+            eLSE
+                If Z08->Z08_VLREPA != (nValorReceb + nValorTaxa)
+                    CONOUT("AQUI")
+                EndIf
+            EndIf
+
+
+            // incrementa tentativa
+            RecLock("Z08", .F.)
+                Z08->Z08_VLREPA := nValorReceb + nValorTaxa
+                Z08->Z08_VLRJUR := nValJuros
+                Z08->Z08_VLRMUL := nValMulta
+            MsUnlock()
+        EndIf
+
+        Z08->(DbSkip())
+    End
+	
+
+Return Nil

@@ -1,0 +1,44 @@
+#Include 'Protheus.ch'
+#Include 'TopConn.ch'
+
+/*/{Protheus.doc} SCHFCEMA
+    Schedule para envio de e-mails da integração do FastConnect
+    @type function
+    @version 1.0
+    @author Daniel Scheeren - Gruppe
+    @since 01/10/2021
+    /*/
+User Function SCHFCEMA()
+
+    Local _cLockFile := ""
+    Local _nHdlJob   := 0
+
+    // prepara ambiente
+	RpcSetType(3)
+	RpcSetEnv("04","01",,,,,,,,,)
+
+    // Montagem do arquivo do job principal - por CNPJ do cliente para evitar múltiplas threads de diferentes agentes concorrendo entre si
+	_cLockFile := Lower( "SCHFCEMA" + cEmpAnt + cFilAnt + AllTrim(MV_PAR01) ) + ".lck"
+    
+    // verifica se o JOB esta em execucao
+	If ( ! JobIsRunning( _cLockFile ) )
+
+		// inicia execucao e controle do JOB
+		_nHdlJob := JobSetRunning( _cLockFile, .T. )
+
+		// se conseguiu acesso exclusivo
+		If ( _nHdlJob >= 0 )
+
+            // envia e-mails pendentes
+			U_FCEnviaEmailsPendentes("Boletos")
+
+		EndIf
+
+		// Libera o Lock
+		JobSetRunning( _cLockFile, .F., _nHdlJob )
+
+	Else
+		Conout("[SCHFCEMA] - Não conseguiu lock. - " + AllTrim(MV_PAR01))
+	EndIf
+
+Return Nil

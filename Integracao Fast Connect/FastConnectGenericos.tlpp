@@ -1,0 +1,1389 @@
+#include "Tlpp-Core.th"
+#include "Tlpp-Rest.th"
+#include "Protheus.ch"
+
+#Define enter Chr(13)+Chr(10)
+
+/*/
+    FUNÇÕES DE USO GENÉRICO RELACIONADAS À INTEGRAÇÃO FAST CONNECT
+    Autor: Daniel Scheeren - Gruppe
+    Data: 01/10/2021
+/*/
+
+
+/*/{Protheus.doc} FCLog
+	Gera log de retorno da integração de boletos
+	@type function
+	@version 1.0
+	@author Daniel Scheeren - Gruppe
+	@since 11/09/2021
+	@param aDadosLog, array, Dados do título para gravação de chave do log
+    @param cMsg, character, Mensagem de log
+    @param cSucesso, character, Retorno da integração
+    @param cJsonEnvio, character, Objeto Json de envio
+    @param jJsonRetorno, json, Objeto Json de retorno
+    @param cDescErro, character, Descrição do erro (em caso de erro)
+	@return lRet
+	/*/
+User Function FCLog(cTpTitulo, aDadosLog, cMsg, cStatus, cJsonEnvio, jJsonRetorno, cDescErro)
+
+	Default cStatus	     := ""
+	Default cJsonEnvio   := ""
+	Default jJsonRetorno := JsonObject():New()
+	Default cDescErro    := ""
+
+	DbSelectArea("Z03")
+	
+	RecLock("Z03", .T.)
+	Z03->Z03_FILIAL	:= FWxFilial("Z03") // Filial
+	Z03->Z03_TITULO := aDadosLog[1]		// Numero do título
+	Z03->Z03_PREFIX := aDadosLog[2] 	// Prefixo do título
+	Z03->Z03_PARCEL	:= aDadosLog[3]		// Parcela
+	Z03->Z03_CLIENT := aDadosLog[4]		// Cliente do título
+	Z03->Z03_LOJA	:= aDadosLog[5]		// Loja do cliente
+	Z03->Z03_DATA 	:= Date()			// Data de gravação da integração
+	Z03->Z03_HORA 	:= Time()			// Hora de gravação da integração
+	Z03->Z03_TIPTIT	:= cTpTitulo		// Tipo do título (BOL=Boleto, CC=Cartão de crédito)
+	Z03->Z03_MENSAG := cMsg				// Mensagem de log
+	Z03->Z03_STATUS := cStatus			// Retorno da integração
+	Z03->Z03_JENVIO := cJsonEnvio		// Json enviado
+	Z03->Z03_JRETOR := jJsonRetorno:ToJson() 	// Json de retorno
+	Z03->Z03_ERRO   := cDescErro 		// Descrição do erro da integração
+	Z03->(MsUnlock())
+
+Return Nil
+
+
+/*/{Protheus.doc} FCLogCap
+	Gera log de captura de cartões de crédito
+	@type function
+	@version 1.0
+	@author Daniel Scheeren - Gruppe
+	@since 13/03/2023
+	@param aDadosLog, array, Dados do título para gravação de chave do log
+    @param cMsg, character, Mensagem de log
+    @param cSucesso, character, Retorno da integração
+    @param cJsonEnvio, character, Objeto Json de envio
+    @param jJsonRetorno, json, Objeto Json de retorno
+    @param cDescErro, character, Descrição do erro (em caso de erro)
+	@return lRet
+	/*/
+User Function FCLogCap(aDadosLog, cMsg, cStatus, cJsonEnvio, cJsonRetorno, cDescErro)
+
+    Local cCodigoRef     := ""
+    Local cLinkCaptura   := ""
+	Default cStatus	     := ""
+	Default cJsonEnvio   := ""
+	Default jJsonRetorno := JsonObject():New()
+	Default cDescErro    := ""
+
+    jJsonRetorno:FromJson(cJsonRetorno)
+
+    cCodigoRef := If(jJsonRetorno:HasProperty('nu_referencia'), jJsonRetorno:GetJsonText('nu_referencia'), "")
+    cLinkCaptura := If(jJsonRetorno:HasProperty('url_link'), jJsonRetorno:GetJsonText('url_link'), "")
+
+	DbSelectArea("Z10")
+	RecLock("Z10", .T.)
+	Z10->Z10_FILIAL	:= FWxFilial("Z10") // Filial
+	Z10->Z10_DATA 	:= Date()			// Data de gravação da integração
+	Z10->Z10_HORA 	:= Time()			// Hora de gravação da integração
+	Z10->Z10_MENSAG := cMsg				// Mensagem de log
+	Z10->Z10_STATUS := cStatus			// Retorno da integração
+	Z10->Z10_JENVIO := cJsonEnvio		// Json enviado
+	Z10->Z10_JRETOR := cJsonRetorno 	// Json de retorno
+	Z10->Z10_CONTRA := aDadosLog[1]     // Numero do contrato
+	Z10->Z10_CLIENT := aDadosLog[2]		// Cliente do título
+	Z10->Z10_LOJA	:= aDadosLog[3]		// Loja do cliente
+	Z10->Z10_TITULO := aDadosLog[4]		// Numero do título
+	Z10->Z10_PREFIX := aDadosLog[5] 	// Prefixo do título
+	Z10->Z10_PARCEL	:= aDadosLog[6]		// Parcela
+	Z10->Z10_TIPTIT	:= aDadosLog[7]		// Tipo do título
+	Z10->Z10_ERRO   := cDescErro 		// Descrição do erro da integração
+	Z10->Z10_CODREF := cCodigoRef 	    // Referência do contrato/titulo vinculado ao link de captura
+	Z10->Z10_IDFAST := "" 		        // Referência registrada na Fast para identificação
+	Z10->Z10_LINKCP := cLinkCaptura     // Link de captura gerado
+	Z10->(MsUnlock())
+
+Return Nil
+
+/*/{Protheus.doc} FCGravaDadosRetorno
+	Grava os dados de retorno da integração
+	@type function
+	@version 1.0
+	@author Daniel Scheeren - Gruppe
+	@since 11/09/2021
+	@param aDadosLog, array, Dados do título para gravação de chave do log
+    @param jJsonRetorno, json, Objeto Json do retorno
+    @param lSucesso, logical, Sucesso na integração
+    @param lReprocessa, logical, Se permite reprocessar o envio
+    @param nRecnoSE1, numeric, Recno do SE1 quando cancelamento para atualizar registro já deletado
+    @param cStatusTitulo, character, Status (etapa) do título
+	/*/
+User Function FCGravaDadosRetorno(cTpIntegracao, aDadosLog, jJsonRetorno, lSucesso, lReprocessa, nRecnoSE1, cStatusTitulo)
+
+    Local lRet           := .T.
+    // tabela da integração
+    Local cTabInteg      := ""
+    // identificador da integração
+    Local cTipIntegracao := ""
+	Local cNumFast       := ""
+    Local nValorReceb    := 0
+    Local nValorFast     := 0
+    Local nValJuros      := 0
+    Local nValMulta      := 0
+    
+	Default cDescErro    := ""
+	Default lReprocessa  := .F.
+
+    // tabela da integração
+    If cTpIntegracao == "boleto"
+        cTabInteg := "Z04"
+        cTipIntegracao := "BOL"
+    ElseIf cTpIntegracao == "credito"
+        cTabInteg := "Z05"
+        cTipIntegracao := "CC"
+    EndIf
+
+    DbSelectArea(cTabInteg)
+    &(cTabInteg)->(DbSetOrder(1))	// 1 - Z0 _FILIAL, Z0 _TITULO, Z0 _PREFIX, Z0 _PARCEL, Z0 _CLIENT, Z0 _LOJA
+    &(cTabInteg)->(DbSeek(FWxFilial(cTabInteg) + aDadosLog[1] + aDadosLog[2] + aDadosLog[3] + aDadosLog[4] + aDadosLog[5]))
+    If &(cTabInteg)->(Found())
+        RecLock(cTabInteg, .F.)
+
+        // campos específicos do boleto
+        If jJsonRetorno:HasProperty("fid")
+            &(cTabInteg)->(&(cTabInteg + "_IDFAST")) := AllTrim(DecodeUTF8(jJsonRetorno["fid"]))				// ID da Fast Connect
+        EndIf
+        If jJsonRetorno:HasProperty("link_pagamento") .and. !Empty(jJsonRetorno["link_pagamento"])
+            &(cTabInteg)->(&(cTabInteg + "_LINKPG")) := AllTrim(DecodeUTF8(jJsonRetorno["link_pagamento"]))	    // Link para pagamento Fast Connect
+        EndIf
+        If jJsonRetorno:HasProperty("linha_digitavel") .and. !Empty(jJsonRetorno["linha_digitavel"])
+            &(cTabInteg)->(&(cTabInteg + "_LINDGT")) := AllTrim(DecodeUTF8(jJsonRetorno["linha_digitavel"]))    // Linha digitável do boleto
+        EndIf
+        If jJsonRetorno:HasProperty("link_pdf") .and. !Empty(jJsonRetorno["link_pdf"])
+            &(cTabInteg)->(&(cTabInteg + "_PDF")) := AllTrim(DecodeUTF8(jJsonRetorno["link_pdf"]))	            // Link do PDF do boleto
+        EndIf
+
+        // campos específicos do cartão de crédito
+        If jJsonRetorno:HasProperty("fid")  // retorna FID quando o envio é de token do cartão
+            &(cTabInteg)->(&(cTabInteg + "_IDFAST")) := AllTrim(DecodeUTF8(jJsonRetorno["fid"]))				// ID da Fast Connect
+        Else
+            If jJsonRetorno:HasProperty("nu_link")  // retorna id do link quando é gerado link de cadastro do cartão
+                &(cTabInteg)->(&(cTabInteg + "_IDFAST")) := AllTrim(cValToChar(jJsonRetorno["nu_link"]))		// ID do link da Fast Connect
+            EndIf
+        EndIf
+
+        If jJsonRetorno:HasProperty("url_link") .and. !Empty(jJsonRetorno["url_link"])
+            &(cTabInteg)->(&(cTabInteg + "_LINKPG")) := AllTrim(DecodeUTF8(jJsonRetorno["url_link"]))	        // Link para pagamento Fast Connect
+        EndIf
+
+
+        If jJsonRetorno:HasProperty("nu_referencia")
+            &(cTabInteg)->(&(cTabInteg + "_CODREF")) := AllTrim(DecodeUTF8(jJsonRetorno["nu_referencia"]))	// Referência Fast Connect
+        EndIf
+        &(cTabInteg)->(&(cTabInteg + "_DATA")) 	 := Date()							// Data de gravação da integração
+        &(cTabInteg)->(&(cTabInteg + "_HORA")) 	 := Time()							// Hora de gravação da integração
+        &(cTabInteg)->(&(cTabInteg + "_STATUS")) := lSucesso						// Retorno da integração
+        &(cTabInteg)->(&(cTabInteg + "_REPROC")) := lReprocessa 					// Se deve reprocessar o envio
+        &(cTabInteg)->(&(cTabInteg + "_REENVI")) := .T.								// Flag para marcar se houve reenvio
+        &(cTabInteg)->(MsUnlock())
+    Else
+        RecLock(cTabInteg, .T.)
+
+        // campos específicos do boleto
+        If jJsonRetorno:HasProperty("fid")
+            &(cTabInteg)->(&(cTabInteg + "_IDFAST")) := AllTrim(DecodeUTF8(jJsonRetorno["fid"]))				// ID da Fast Connect
+        EndIf
+        If jJsonRetorno:HasProperty("link_pagamento") .and. !Empty(jJsonRetorno["link_pagamento"])
+            &(cTabInteg)->(&(cTabInteg + "_LINKPG")) := AllTrim(DecodeUTF8(jJsonRetorno["link_pagamento"]))	    // Link para pagamento Fast Connect
+        EndIf
+        If jJsonRetorno:HasProperty("linha_digitavel") .and. !Empty(jJsonRetorno["linha_digitavel"])
+            &(cTabInteg)->(&(cTabInteg + "_LINDGT")) := AllTrim(DecodeUTF8(jJsonRetorno["linha_digitavel"]))    // Linha digitável do boleto
+        EndIf
+        If jJsonRetorno:HasProperty("link_pdf") .and. !Empty(jJsonRetorno["link_pdf"])
+            &(cTabInteg)->(&(cTabInteg + "_PDF")) := AllTrim(DecodeUTF8(jJsonRetorno["link_pdf"]))	            // Link do PDF do boleto
+        EndIf
+        
+
+        // campos específicos do cartão de crédito
+        If jJsonRetorno:HasProperty("fid")  // retorna FID quando o envio é de token do cartão
+            &(cTabInteg)->(&(cTabInteg + "_IDFAST")) := AllTrim(DecodeUTF8(jJsonRetorno["fid"]))				// ID da Fast Connect
+        Else
+            If jJsonRetorno:HasProperty("nu_link")  // retorna id do link quando é gerado link de cadastro do cartão
+                &(cTabInteg)->(&(cTabInteg + "_IDFAST")) := AllTrim(cValToChar(jJsonRetorno["nu_link"]))		    // ID do link da Fast Connect
+            EndIf
+        EndIf
+        If jJsonRetorno:HasProperty("url_link") .and. !Empty(jJsonRetorno["url_link"])
+            &(cTabInteg)->(&(cTabInteg + "_LINKPG")) := AllTrim(DecodeUTF8(jJsonRetorno["url_link"]))	        // Link para pagamento Fast Connect
+        EndIf
+
+
+        If jJsonRetorno:HasProperty("nu_referencia")
+            &(cTabInteg)->(&(cTabInteg + "_CODREF")) := AllTrim(DecodeUTF8(jJsonRetorno["nu_referencia"]))	// Referência Fast Connect
+        EndIf
+        &(cTabInteg)->(&(cTabInteg + "_FILIAL")) := FWxFilial(cTabInteg) 		    // Filial
+        &(cTabInteg)->(&(cTabInteg + "_TITULO")) := aDadosLog[1]					// Numero do título
+        &(cTabInteg)->(&(cTabInteg + "_PREFIX")) := aDadosLog[2] 					// Prefixo do título
+        &(cTabInteg)->(&(cTabInteg + "_PARCEL")) := aDadosLog[3] 					// Parcela
+        &(cTabInteg)->(&(cTabInteg + "_CLIENT")) := aDadosLog[4]					// Cliente do título
+        &(cTabInteg)->(&(cTabInteg + "_LOJA"))	 := aDadosLog[5]					// Loja do cliente
+        &(cTabInteg)->(&(cTabInteg + "_DATA")) 	 := Date()							// Data de gravação da integração
+        &(cTabInteg)->(&(cTabInteg + "_HORA")) 	 := Time()							// Hora de gravação da integração
+        &(cTabInteg)->(&(cTabInteg + "_STATUS")) := lSucesso						// Retorno da integração
+        &(cTabInteg)->(&(cTabInteg + "_REPROC")) := lReprocessa 					// Se deve reprocessar o envio
+        &(cTabInteg)->(&(cTabInteg + "_REENVI")) := .F.								// Flag para marcar se houve reenvio
+        &(cTabInteg)->(&(cTabInteg + "_CANCEL")) := .F.								// Flag para marcar se houve exclusão do boleto
+        &(cTabInteg)->(MsUnlock())
+    EndIf
+
+	// altera status dos títulos conforme integração
+	DbSelectArea("SE1")
+
+    // se possui recno é cancelamento (registro está deletado)
+    If (nRecnoSE1 == Nil)
+        SE1->(DbSetOrder(1))	// 1 - E1_FILIAL, E1_PREFIXO, E1_NUM, E1_PARCELA, E1_TIPO
+        SE1->(DbSeek(FWxFilial("SE1") + aDadosLog[2] + aDadosLog[1] + aDadosLog[3] + aDadosLog[6]))
+
+
+            // teve sucesso na integração com a Fast
+            If lSucesso
+            
+                // busca número da venda da Fast Connect se vazio
+                If jJsonRetorno:HasProperty("nu_venda")
+                    cNumFast := SubStr(jJsonRetorno["nu_venda"], 1, 6)
+                EndIf
+                
+                // integração de cartão de crédito
+                If cTpIntegracao == "credito"
+                    If jJsonRetorno:HasProperty("ds_cartao_token")
+                        // grava token do cartão para futuros envios
+                        DbSelectArea("SA1")
+                        SA1->(DbSetOrder(1))	// 1- A1_FILIAL, A1_COD, A1_LOJA
+                        If SA1->(DbSeek(FWxFilial("SA1") + SE1->E1_CLIENTE + SE1->E1_LOJA))
+                            If Empty(SA1->A1_ZCCTOKE)
+                                RecLock("SA1", .F.)
+                                    SA1->A1_ZCCTOKE := AllTrim(DecodeUTF8(jJsonRetorno["ds_cartao_token"]))	// token do cartão utilizado para não necessitar passar os dados do cartão a cada integração
+                                SA1->(MsUnlock())
+                            EndIf
+                        EndIf
+                    EndIf
+                EndIf
+
+                // B=Baixado/Pago
+                If cStatusTitulo == "B"
+                    // data do pagamento para efetuar a baixa
+                    dDataBaixa := SToD(SubStr(StrTran(jJsonRetorno["dt_pagamento"], "-", ""), 1, 8))
+                    dDataReceb := SToD(SubStr(StrTran(jJsonRetorno["dt_recebimento"], "-", ""), 1, 8))
+
+                    // valor total do título (valor da fast em alguns casos não envia iss, portanto baixa com o valor do título)
+                    // nValorReceb := SE1->E1_SALDO //Val(jJsonRetorno['vl_venda'])
+                    // valor repasssado pela fast (sem valor da taxa da fast)
+                    nValorReceb  := Val(jJsonRetorno['vl_recebido'])
+                    // valor real do título cobrado ao cliente (total)
+                    // nValorTitulo := U_FCCalcVlrTitulo()
+                    // valor da venda enviada á Fast (total)
+                    nValorTotFast   := Val(jJsonRetorno['vl_venda'])
+
+                    // valor retido pela fast pela taxa cobrada
+                    nValorTaxa := U_FCCalcVlrTaxa(nValorTotFast, cTipIntegracao)
+
+                    // valor pago após vencimento
+                    If dDataBaixa > SE1->E1_VENCREA
+
+                        // valor de juros e multa
+                        If jJsonRetorno:HasProperty('vl_juros')
+                            nValJuros := Val(jJsonRetorno["vl_juros"])
+
+                            // verifica se o valor repassado menos o valor de taxa da fast 
+                            If nValJuros == 0 .and. ((nValorReceb + nValorTaxa) - nValorTotFast) > 0
+                                // valor de juros + multa
+                                nVlrSobra := ((nValorReceb + nValorTaxa) - nValorTotFast)
+                                nValMulta := Round(nValorTotFast * 0.02, 2)   // calcula 2% de multa
+                                nValJuros := nVlrSobra - nValMulta
+                            EndIf
+                        EndIf
+                        If jJsonRetorno:HasProperty('vl_multa') .and. nValMulta == 0
+                            nValMulta := Val(jJsonRetorno["vl_multa"])
+                        EndIf
+                    EndIf
+
+                    // retorna se foi possível baixar o título, se não baixar permanece no mesmo status
+                    lRet := BaixaTitulo(cTipIntegracao, dDataBaixa, dDataReceb, nValorTotFast, nValorReceb, nValorTaxa, nValJuros, nValMulta, cNumFast)
+                EndIf
+
+                // atualiza o status
+                If lRet
+                    RecLock("SE1", .F.)
+                        // atualiza dados do banco
+                        If Empty(SE1->E1_PORTADO)
+                            SE1->E1_PORTADO := SuperGetMV("MV_FCBANCO", .F., "")
+                        EndIf
+                        If Empty(SE1->E1_AGEDEP)
+                            SE1->E1_AGEDEP  := SuperGetMV("MV_FCAGENC", .F., "")
+                        EndIf
+                        If Empty(SE1->E1_CONTA)
+                            SE1->E1_CONTA   := SuperGetMV("MV_FCCONTA", .F., "")
+                        EndIf
+                        
+                        // status do título
+                        SE1->E1_ZSTATFC := cStatusTitulo
+
+                        // código da venda da Fast
+                        If !Empty(cNumFast)
+                            SE1->E1_ZNUMFST := cNumFast
+                        EndIf
+                    MsUnlock()
+                EndIf
+            Else
+                RecLock("SE1", .F.)
+                    // erro na integração
+                    SE1->E1_ZSTATFC := cStatusTitulo
+                MsUnlock()
+            EndIf
+
+    // cancelamento
+    Else
+        SE1->(DbGoTo(nRecnoSE1))
+
+        RecLock("SE1", .F.)
+            // teve sucesso na integração com a Fast
+            If lSucesso
+                // cancelado com sucesso
+                SE1->E1_ZSTATFC := cStatusTitulo
+            Else
+                // erro no cancelamento
+                SE1->E1_ZSTATFC := cStatusTitulo
+            EndIf
+        MsUnlock()
+
+        // conseguiu cancelar
+        // If lSucesso
+        //     // exclui o registro da integração
+        //     RecLock(cTabInteg, .F.)
+        //         &(cTabInteg)->(DbDelete())
+        //     &(cTabInteg)->(MsUnlock())
+        // EndIf
+    EndIf
+
+Return lRet
+
+/*/{Protheus.doc} FCFormataErrosRetorno
+	Extrai informações de erro do json de retorno
+	@type function
+	@version 1.0
+	@author Daniel Scheeren - Gruppe
+	@since 01/10/2021
+	@param jJsonRet, json, Json de retorno (erro)
+	@return cRetErro, Descrição do erro
+	/*/
+User Function FCFormataErrosRetorno(jJsonRet)
+
+	Local cRetErro := ""
+	Local jJsonErrors := Nil
+	
+	If jJsonRet:HasProperty("errors") .and. Len(jJsonRet:GetJsonObject("errors")) > 0
+
+		// objeto json da variável errors
+		jJsonErrors := jJsonRet:GetJsonObject("errors")[1]
+
+		If jJsonErrors:HasProperty("message")
+
+            If !Empty(jJsonErrors["message"])
+                // transforma mensagem
+                cRetErro += " - " + DecodeUTF8(jJsonErrors["message"])
+            EndIf
+		EndIf
+		
+		If jJsonErrors:HasProperty("fields") .and. Len(jJsonErrors:GetJsonObject("fields")) > 0
+
+			// objeto json da variável fields
+			jJsonFields := jJsonErrors:GetJsonObject("fields")[1]
+
+			If jJsonFields:HasProperty("details") .and. Len(jJsonFields:GetJsonObject("details")) > 0
+				// transforma mensagem
+				cRetErro += ": " + DecodeUTF8(jJsonFields["details"][1])
+			ElseIf jJsonFields:HasProperty("message")
+				// transforma mensagem
+				cRetErro += ": " + DecodeUTF8(jJsonFields["message"])
+			EndIf
+
+		EndIf
+	EndIf
+	
+Return cRetErro
+
+/*/{Protheus.doc} FCEnvioDeEMail
+    Cadastra envio de e-mail (envio é realizado via JOB)
+    @type function
+    @version 1.0
+    @author Daniel Scheeren - Gruppe
+    @since 01/10/2021
+    @param cAssunto, character, Assunto do e-mail
+    @param cDestinatarios, character, E-mails dos destinatários
+    @param cCopia, character, E-mails em cópia
+    @param cMensagem, character, Mensagem do corpo do e-mail
+    @return variant, return_description
+    /*/
+User Function FCEnvioDeEMail(aDadosTitulo, cTipTitulo)
+
+	// insere Registro na Tabela de Mensagens.
+	Dbselectarea("Z06")
+	Reclock("Z06", .T.)
+	Z06->Z06_FILIAL := FWxFilial("Z06")
+	Z06->Z06_USUARI := RetCodUsr()          // Código do Usuário
+	Z06->Z06_DATAIN := Date()               // Data da geraçao da Mensagem
+	Z06->Z06_HORAIN := Time()               // Hora
+	Z06->Z06_TITULO := aDadosTitulo[1]      // Titulo
+	Z06->Z06_PREFIX := aDadosTitulo[2]      // Prefixo
+	Z06->Z06_CLIENT := aDadosTitulo[3]      // Cliente
+	Z06->Z06_LOJA   := aDadosTitulo[4]      // Loja
+	Z06->Z06_TIPTIT := cTipTitulo           // Tipo do título (Boleto, Cartão de crédito...)
+	// Z06->Z06_ASSUNT := cAssunto             // Assunto
+	// Z06->Z06_DESTIN := cDestinatarios       // E-mails de destinatários
+	// Z06->Z06_COPIA  := cCopia               // E-mails em Cópia
+	// Z06->Z06_MENSAG := cMensagem            // Mensagem do corpo do e-mail
+	Z06->Z06_STATUS := "P"                  // Status envio (P=Pendente; S=Sucesso ; E=Erro)
+	Z06->Z06_REENVI := .F.                  // Reenviado
+	Z06->(MsUnlock())
+
+    // grava log
+    U_FCLog(cTipTitulo,;
+                aDadosTitulo,;
+                "Envio de e-mail da ocorrência.",;
+                "M")
+
+Return (.T.)
+
+/*/{Protheus.doc} WsFCEnviaEmails
+    description
+    @type function
+    @version 1.0
+    @author Daniel Scheeren - Gruppe
+    @since 01/10/2021
+    @param param_name, variant, param_description
+    @return variant, return_description
+    /*/
+User Function FCEnviaEmailsPendentes(cTpTitulo)
+
+    Local aDados         := {}
+    Local cAssunto 		 := cTpTitulo + " com erro no envio para Fast connect."
+    Local cDestinatarios := SuperGetMV("MV_XFCMAIL", .F., "daniel.scheeren@gruppe.com.br")
+    Local cCopia 		 := ""
+// TODO ADICIONAR MESGEM DE ERRO
+	// busca e-mails pendentes de envio
+	_cQuery := " SELECT Z06_TITULO, Z06_PREFIX, Z06_CLIENT, Z06_LOJA,  "
+	_cQuery += " FROM " + RetSQLTab("Z06")
+	_cQuery += " WHERE " + RetSQLCond("Z06")
+	// somente pendentes
+	_cQuery += " AND Z06_STATUS = 'P' "
+
+	aDados := U_SQLToVet(_cQuery)
+
+    If !Empty(aDados)
+        // envia e-mail pendente
+        EnviaEmail(aDados, cAssunto, cDestinatarios, cCopia, cTpTitulo)
+    EndIf
+    
+Return Nil
+
+
+Static Function EnviaEmail(aTitulosComErro, cSubject, cTo, cCC, cTpTitulo)
+
+	Local lOk     		:= .T.
+	Local cAccount 		:= AllTrim(SuperGetMV("MV_RELACNT" ,.F., "",cFilAnt))
+	Local cFrom			:= AllTrim(SuperGetMV("MV_RELFROM" ,.F., "",cFilAnt))
+	Local cPassword 	:= AllTrim(SuperGetMV("MV_RELPSW", .F., "",cFilAnt))
+	Local cSMTP			:= AllTrim(SuperGetMV("MV_RELSERV", .F., "",cFilAnt))
+	Local cUser 		:= AllTrim(SuperGetMV("MV_RELAUSR", .F., "",cFilAnt))
+	Local nTimeOut 		:= SuperGetMV("MV_RELTIME", .F., 30,cFilAnt)
+	Local lAuth			:= SuperGetMV("MV_RELAUTH", .F., .F.,cFilAnt)
+	Local lSSL			:= SuperGetMV("MV_RELSSL", .F., .F.,cFilAnt)
+	Local lTLS			:= SuperGetMV("MV_RELTLS", .F., .F.,cFilAnt)
+	Local nPort 		:= SuperGetMV("MV_PORSMTP", .F., 25,cFilAnt)
+	Local nError		:= 0
+	Local oMessage		:= Nil
+	Local oSMTP			:= Nil
+
+	Default cCC			:= ""
+	Default cSubject	:= "E-mail enviado via TOTVS Protheus"
+	Default lView		:= .T.
+	Default _cAtch		:= ""
+	Default _cFrom		:= ""
+
+	cTo   := Alltrim(cTo)
+	cCC   := Alltrim(cCC)
+	cFrom := Alltrim(cFrom)
+    // monta HTML
+    cBody := U_FCHtmlEmail(cTpTitulo, aTitulosComErro)
+
+    oSMTP := TMailManager():New()
+
+    // Quando for informado a porta, separa do endereço.
+    If At(':', cSMTP) > 0
+        nPort := Val(SubStr(cSMTP, At(':', cSMTP) + 1))
+        cSMTP := SubStr(cSMTP, 1, At(':', cSMTP) - 1)
+    EndIf
+
+    If nPort == 465 .And. lSSL == .F.
+        lSSL := .T.
+    ElseIf nPort == 587 .And. lTLS == .F.
+        lTLS := .T.
+    EndIf
+
+    oSMTP:SetUseSSL(lSSL)
+    oSMTP:SetUseTLS(lTLS)
+
+    If (nPosAt := At('@', cAccount)) > 0
+        cAccount := SubStr(cAccount, 1, nPosAt - 1)
+    Endif
+
+    Begin Sequence
+        // Configura dados para conexão.
+        If (nError := oSMTP:Init("", cSMTP, cAccount, cPassword, , nPort)) != 0
+            Break
+        EndIf
+
+        // Seta o TimeOut(em segundos) para conexao baseado no parametro MV_RELTIME.
+        oSMTP:SetSMTPTimeOut(nTimeOut)
+
+        // Conecta ao servidor SMTP.
+        If (nError := oSMTP:SMTPConnect()) != 0
+            Break
+        EndIf
+
+        // Autentica se houver a necessidade.
+        If lAuth .And. (nError := oSMTP:SMTPAuth(cUser, cPassword)) != 0
+            Break
+        EndIf
+
+        // Inicia objeto de mensagem de e-mail.
+        oMessage := TMailMessage():New()
+        oMessage:cFrom := cFrom
+        oMessage:cTo := cTo
+        oMessage:cCc := cCC
+        oMessage:cSubject := cSubject
+        oMessage:cBody := cBody
+
+        // Realiza o envio da mensagem.
+        If (nError := oMessage:Send(oSMTP)) != 0
+            Break
+        EndIf
+    Recover
+        If !IsBlind()
+            ShowHelpDlg("ErrMail", {"Erro ao realizar o envio do e-mail: ", oSMTP:GetErrorString(nError)}, 2, {"Verifique as informações"}, 1)
+        EndIf
+        lOk := .F.
+    End Sequence
+
+    oSMTP:SMTPDisconnect()
+
+    FreeObj(oSMTP)
+    FreeObj(oMessage)
+
+Return lOk
+
+
+/*/{Protheus.doc} FCHtmlEmail
+    Monta HTML do e-mail para envio
+    @type function
+    @version 1.0
+    @author Daniel Scheeren - Gruppe
+    @since 01/10/2021
+    @param cTpTitulo, character, Tipo do título para descrição (Boleto, Cartão de crédito...)
+    @param aDadosTitulo, array, Dados do título financeiro
+    @param cErro, character, Descrição do erro
+    @return cRetHtml, HTML com os dados para exibição
+    /*/
+User Function FCHtmlEmail(cTpTitulos, aDadosTitulo)
+    
+    Local cRetHtml    := ""
+    Local nX
+
+    Default cTpTitulos := ""
+    Default cErro     := ""
+
+    If Len(aDadosTitulo) > 0
+
+        cRetHtml +='<!doctype html>                                                                                                                                                                                 '
+        cRetHtml +='<html>                                                                                                                                                                                          '
+        cRetHtml +='  <head>                                                                                                                                                                                        '
+        cRetHtml +='    <meta name="viewport" content="width=device-width" />                                                                                                                                       '
+        cRetHtml +='    <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />                                                                                                                       '
+        cRetHtml +='    <title>Erro no envio de ' + cTpTitulos + '</title>                                                                                                                                              '
+        cRetHtml +='    <style>                                                                                                                                                                                     '
+        cRetHtml +='      /* -------------------------------------                                                                                                                                                  '
+        cRetHtml +='          GLOBAL RESETS                                                                                                                                                                         '
+        cRetHtml +='      ------------------------------------- */                                                                                                                                                  '
+        cRetHtml +='      img {                                                                                                                                                                                     '
+        cRetHtml +='        border: none;                                                                                                                                                                           '
+        cRetHtml +='        -ms-interpolation-mode: bicubic;                                                                                                                                                        '
+        cRetHtml +='        max-width: 100%; }                                                                                                                                                                      '
+        cRetHtml +='      body {                                                                                                                                                                                    '
+        cRetHtml +='        background-color: #f6f6f6;                                                                                                                                                              '
+        cRetHtml +='        font-family: sans-serif;                                                                                                                                                                '
+        cRetHtml +='        -webkit-font-smoothing: antialiased;                                                                                                                                                    '
+        cRetHtml +='        font-size: 14px;                                                                                                                                                                        '
+        cRetHtml +='        line-height: 1.4;                                                                                                                                                                       '
+        cRetHtml +='        margin: 0;                                                                                                                                                                              '
+        cRetHtml +='        padding: 0;                                                                                                                                                                             '
+        cRetHtml +='        -ms-text-size-adjust: 100%;                                                                                                                                                             '
+        cRetHtml +='        -webkit-text-size-adjust: 100%; }                                                                                                                                                       '
+        cRetHtml +='      table {                                                                                                                                                                                   '
+        cRetHtml +='        border-collapse: separate;                                                                                                                                                              '
+        cRetHtml +='        mso-table-lspace: 0pt;                                                                                                                                                                  '
+        cRetHtml +='        mso-table-rspace: 0pt;                                                                                                                                                                  '
+        cRetHtml +='        width: 100%; }                                                                                                                                                                          '
+        cRetHtml +='        table td {                                                                                                                                                                              '
+        cRetHtml +='          font-family: sans-serif;                                                                                                                                                              '
+        cRetHtml +='          font-size: 14px;                                                                                                                                                                      '
+        cRetHtml +='          vertical-align: top; }                                                                                                                                                                '
+        cRetHtml +='      /* -------------------------------------                                                                                                                                                  '
+        cRetHtml +='          BODY & CONTAINER                                                                                                                                                                      '
+        cRetHtml +='      ------------------------------------- */                                                                                                                                                  '
+        cRetHtml +='      .body {                                                                                                                                                                                   '
+        cRetHtml +='        background-color: #f6f6f6;                                                                                                                                                              '
+        cRetHtml +='        width: 100%; }                                                                                                                                                                          '
+        cRetHtml +='      /* Set a max-width, and make it display as block so it will automatically stretch  */                                                                                                     '
+        cRetHtml +='      .container {                                                                                                                                                                              '
+        cRetHtml +='        display: block;                                                                                                                                                                         '
+        cRetHtml +='        Margin: 0 auto !important;                                                                                                                                                              '
+        cRetHtml +='        /* makes it centered */                                                                                                                                                                 '
+        cRetHtml +='        max-width: 580px;                                                                                                                                                                       '
+        cRetHtml +='        padding: 10px;                                                                                                                                                                          '
+        cRetHtml +='        width: 580px; }                                                                                                                                                                         '
+        cRetHtml +='      /* This should also be a block element, so that it will fill 100% of the .container */                                                                                                    '
+        cRetHtml +='      .content {                                                                                                                                                                                '
+        cRetHtml +='        box-sizing: border-box;                                                                                                                                                                 '
+        cRetHtml +='        display: block;                                                                                                                                                                         '
+        cRetHtml +='        Margin: 0 auto;                                                                                                                                                                         '
+        cRetHtml +='        max-width: 580px;                                                                                                                                                                       '
+        cRetHtml +='        padding: 10px; }                                                                                                                                                                        '
+        cRetHtml +='      /* -------------------------------------                                                                                                                                                  '
+        cRetHtml +='          HEADER, FOOTER, MAIN                                                                                                                                                                  '
+        cRetHtml +='      ------------------------------------- */                                                                                                                                                  '
+        cRetHtml +='      .main {                                                                                                                                                                                   '
+        cRetHtml +='        background: #ffffff;                                                                                                                                                                    '
+        cRetHtml +='        border-radius: 3px;                                                                                                                                                                     '
+        cRetHtml +='        width: 100%; }                                                                                                                                                                          '
+        cRetHtml +='      .wrapper {                                                                                                                                                                                '
+        cRetHtml +='        box-sizing: border-box;                                                                                                                                                                 '
+        cRetHtml +='        padding: 20px; }                                                                                                                                                                        '
+        cRetHtml +='      .content-block {                                                                                                                                                                          '
+        cRetHtml +='        padding-bottom: 10px;                                                                                                                                                                   '
+        cRetHtml +='        padding-top: 10px;                                                                                                                                                                      '
+        cRetHtml +='      }                                                                                                                                                                                         '
+        cRetHtml +='      .footer {                                                                                                                                                                                 '
+        cRetHtml +='        clear: both;                                                                                                                                                                            '
+        cRetHtml +='        Margin-top: 10px;                                                                                                                                                                       '
+        cRetHtml +='        text-align: center;                                                                                                                                                                     '
+        cRetHtml +='        width: 100%; }                                                                                                                                                                          '
+        cRetHtml +='        .footer td,                                                                                                                                                                             '
+        cRetHtml +='        .footer p,                                                                                                                                                                              '
+        cRetHtml +='        .footer span,                                                                                                                                                                           '
+        cRetHtml +='        .footer a {                                                                                                                                                                             '
+        cRetHtml +='          color: #999999;                                                                                                                                                                       '
+        cRetHtml +='          font-size: 12px;                                                                                                                                                                      '
+        cRetHtml +='          text-align: center; }                                                                                                                                                                 '
+        cRetHtml +='      /* -------------------------------------                                                                                                                                                  '
+        cRetHtml +='          TYPOGRAPHY                                                                                                                                                                            '
+        cRetHtml +='      ------------------------------------- */                                                                                                                                                  '
+        cRetHtml +='      h1,                                                                                                                                                                                       '
+        cRetHtml +='      h2,                                                                                                                                                                                       '
+        cRetHtml +='      h3,                                                                                                                                                                                       '
+        cRetHtml +='      h4 {                                                                                                                                                                                      '
+        cRetHtml +='        color: #000000;                                                                                                                                                                         '
+        cRetHtml +='        font-family: sans-serif;                                                                                                                                                                '
+        cRetHtml +='        font-weight: 400;                                                                                                                                                                       '
+        cRetHtml +='        line-height: 1.4;                                                                                                                                                                       '
+        cRetHtml +='        margin: 0;                                                                                                                                                                              '
+        cRetHtml +='        Margin-bottom: 30px; }                                                                                                                                                                  '
+        cRetHtml +='      h1 {                                                                                                                                                                                      '
+        cRetHtml +='        font-size: 35px;                                                                                                                                                                        '
+        cRetHtml +='        font-weight: 300;                                                                                                                                                                       '
+        cRetHtml +='        text-align: center;                                                                                                                                                                     '
+        cRetHtml +='        text-transform: capitalize; }                                                                                                                                                           '
+        cRetHtml +='      p,                                                                                                                                                                                        '
+        cRetHtml +='      ul,                                                                                                                                                                                       '
+        cRetHtml +='      ol {                                                                                                                                                                                      '
+        cRetHtml +='        font-family: sans-serif;                                                                                                                                                                '
+        cRetHtml +='        font-size: 14px;                                                                                                                                                                        '
+        cRetHtml +='        font-weight: normal;                                                                                                                                                                    '
+        cRetHtml +='        margin: 0;                                                                                                                                                                              '
+        cRetHtml +='        Margin-bottom: 15px; }                                                                                                                                                                  '
+        cRetHtml +='        p li,                                                                                                                                                                                   '
+        cRetHtml +='        ul li,                                                                                                                                                                                  '
+        cRetHtml +='        ol li {                                                                                                                                                                                 '
+        cRetHtml +='          list-style-position: inside;                                                                                                                                                          '
+        cRetHtml +='          margin-left: 5px; }                                                                                                                                                                   '
+        cRetHtml +='      a {                                                                                                                                                                                       '
+        cRetHtml +='        color: #3498db;                                                                                                                                                                         '
+        cRetHtml +='        text-decoration: underline; }                                                                                                                                                           '
+        cRetHtml +='      /* -------------------------------------                                                                                                                                                  '
+        cRetHtml +='          BUTTONS                                                                                                                                                                               '
+        cRetHtml +='      ------------------------------------- */                                                                                                                                                  '
+        cRetHtml +='      .btn {                                                                                                                                                                                    '
+        cRetHtml +='        box-sizing: border-box;                                                                                                                                                                 '
+        cRetHtml +='        width: 100%; }                                                                                                                                                                          '
+        cRetHtml +='        .btn > tbody > tr > td {                                                                                                                                                                '
+        cRetHtml +='          padding-bottom: 15px; }                                                                                                                                                               '
+        cRetHtml +='        .btn table {                                                                                                                                                                            '
+        cRetHtml +='          width: auto; }                                                                                                                                                                        '
+        cRetHtml +='        .btn table td {                                                                                                                                                                         '
+        cRetHtml +='          background-color: #ffffff;                                                                                                                                                            '
+        cRetHtml +='          border-radius: 5px;                                                                                                                                                                   '
+        cRetHtml +='          text-align: center; }                                                                                                                                                                 '
+        cRetHtml +='        .btn a {                                                                                                                                                                                '
+        cRetHtml +='          background-color: #ffffff;                                                                                                                                                            '
+        cRetHtml +='          border: solid 1px #3498db;                                                                                                                                                            '
+        cRetHtml +='          border-radius: 5px;                                                                                                                                                                   '
+        cRetHtml +='          box-sizing: border-box;                                                                                                                                                               '
+        cRetHtml +='          color: #3498db;                                                                                                                                                                       '
+        cRetHtml +='          cursor: pointer;                                                                                                                                                                      '
+        cRetHtml +='          display: inline-block;                                                                                                                                                                '
+        cRetHtml +='          font-size: 14px;                                                                                                                                                                      '
+        cRetHtml +='          font-weight: bold;                                                                                                                                                                    '
+        cRetHtml +='          margin: 0;                                                                                                                                                                            '
+        cRetHtml +='          padding: 12px 25px;                                                                                                                                                                   '
+        cRetHtml +='          text-decoration: none;                                                                                                                                                                '
+        cRetHtml +='          text-transform: capitalize; }                                                                                                                                                         '
+        cRetHtml +='      .btn-primary table td {                                                                                                                                                                   '
+        cRetHtml +='        background-color: #3498db; }                                                                                                                                                            '
+        cRetHtml +='      .btn-primary a {                                                                                                                                                                          '
+        cRetHtml +='        background-color: #3498db;                                                                                                                                                              '
+        cRetHtml +='        border-color: #3498db;                                                                                                                                                                  '
+        cRetHtml +='        color: #ffffff; }                                                                                                                                                                       '
+        cRetHtml +='      /* -------------------------------------                                                                                                                                                  '
+        cRetHtml +='          OTHER STYLES THAT MIGHT BE USEFUL                                                                                                                                                     '
+        cRetHtml +='      ------------------------------------- */                                                                                                                                                  '
+        cRetHtml +='      .last {                                                                                                                                                                                   '
+        cRetHtml +='        margin-bottom: 0; }                                                                                                                                                                     '
+        cRetHtml +='      .first {                                                                                                                                                                                  '
+        cRetHtml +='        margin-top: 0; }                                                                                                                                                                        '
+        cRetHtml +='      .align-center {                                                                                                                                                                           '
+        cRetHtml +='        text-align: center; }                                                                                                                                                                   '
+        cRetHtml +='      .align-right {                                                                                                                                                                            '
+        cRetHtml +='        text-align: right; }                                                                                                                                                                    '
+        cRetHtml +='      .align-left {                                                                                                                                                                             '
+        cRetHtml +='        text-align: left; }                                                                                                                                                                     '
+        cRetHtml +='      .clear {                                                                                                                                                                                  '
+        cRetHtml +='        clear: both; }                                                                                                                                                                          '
+        cRetHtml +='      .mt0 {                                                                                                                                                                                    '
+        cRetHtml +='        margin-top: 0; }                                                                                                                                                                        '
+        cRetHtml +='      .mb0 {                                                                                                                                                                                    '
+        cRetHtml +='        margin-bottom: 0; }                                                                                                                                                                     '
+        cRetHtml +='      .preheader {                                                                                                                                                                              '
+        cRetHtml +='        color: transparent;                                                                                                                                                                     '
+        cRetHtml +='        display: none;                                                                                                                                                                          '
+        cRetHtml +='        height: 0;                                                                                                                                                                              '
+        cRetHtml +='        max-height: 0;                                                                                                                                                                          '
+        cRetHtml +='        max-width: 0;                                                                                                                                                                           '
+        cRetHtml +='        opacity: 0;                                                                                                                                                                             '
+        cRetHtml +='        overflow: hidden;                                                                                                                                                                       '
+        cRetHtml +='        mso-hide: all;                                                                                                                                                                          '
+        cRetHtml +='        visibility: hidden;                                                                                                                                                                     '
+        cRetHtml +='        width: 0; }                                                                                                                                                                             '
+        cRetHtml +='      .powered-by a {                                                                                                                                                                           '
+        cRetHtml +='        text-decoration: none; }                                                                                                                                                                '
+        cRetHtml +='      hr {                                                                                                                                                                                      '
+        cRetHtml +='        border: 0;                                                                                                                                                                              '
+        cRetHtml +='        border-bottom: 1px solid #f6f6f6;                                                                                                                                                       '
+        cRetHtml +='        Margin: 20px 0; }                                                                                                                                                                       '
+        cRetHtml +='      /* -------------------------------------                                                                                                                                                  '
+        cRetHtml +='          RESPONSIVE AND MOBILE FRIENDLY STYLES                                                                                                                                                 '
+        cRetHtml +='      ------------------------------------- */                                                                                                                                                  '
+        cRetHtml +='      @media only screen and (max-width: 620px) {                                                                                                                                               '
+        cRetHtml +='        table[class=body] h1 {                                                                                                                                                                  '
+        cRetHtml +='          font-size: 28px !important;                                                                                                                                                           '
+        cRetHtml +='          margin-bottom: 10px !important; }                                                                                                                                                     '
+        cRetHtml +='        table[class=body] p,                                                                                                                                                                    '
+        cRetHtml +='        table[class=body] ul,                                                                                                                                                                   '
+        cRetHtml +='        table[class=body] ol,                                                                                                                                                                   '
+        cRetHtml +='        table[class=body] td,                                                                                                                                                                   '
+        cRetHtml +='        table[class=body] span,                                                                                                                                                                 '
+        cRetHtml +='        table[class=body] a {                                                                                                                                                                   '
+        cRetHtml +='          font-size: 16px !important; }                                                                                                                                                         '
+        cRetHtml +='        table[class=body] .wrapper,                                                                                                                                                             '
+        cRetHtml +='        table[class=body] .article {                                                                                                                                                            '
+        cRetHtml +='          padding: 10px !important; }                                                                                                                                                           '
+        cRetHtml +='        table[class=body] .content {                                                                                                                                                            '
+        cRetHtml +='          padding: 0 !important; }                                                                                                                                                              '
+        cRetHtml +='        table[class=body] .container {                                                                                                                                                          '
+        cRetHtml +='          padding: 0 !important;                                                                                                                                                                '
+        cRetHtml +='          width: 100% !important; }                                                                                                                                                             '
+        cRetHtml +='        table[class=body] .main {                                                                                                                                                               '
+        cRetHtml +='          border-left-width: 0 !important;                                                                                                                                                      '
+        cRetHtml +='          border-radius: 0 !important;                                                                                                                                                          '
+        cRetHtml +='          border-right-width: 0 !important; }                                                                                                                                                   '
+        cRetHtml +='        table[class=body] .btn table {                                                                                                                                                          '
+        cRetHtml +='          width: 100% !important; }                                                                                                                                                             '
+        cRetHtml +='        table[class=body] .btn a {                                                                                                                                                              '
+        cRetHtml +='          width: 100% !important; }                                                                                                                                                             '
+        cRetHtml +='        table[class=body] .img-responsive {                                                                                                                                                     '
+        cRetHtml +='          height: auto !important;                                                                                                                                                              '
+        cRetHtml +='          max-width: 100% !important;                                                                                                                                                           '
+        cRetHtml +='          width: auto !important; }}                                                                                                                                                            '
+        cRetHtml +='      /* -------------------------------------                                                                                                                                                  '
+        cRetHtml +='          PRESERVE THESE STYLES IN THE HEAD                                                                                                                                                     '
+        cRetHtml +='      ------------------------------------- */                                                                                                                                                  '
+        cRetHtml +='      @media all {                                                                                                                                                                              '
+        cRetHtml +='        .ExternalClass {                                                                                                                                                                        '
+        cRetHtml +='          width: 100%; }                                                                                                                                                                        '
+        cRetHtml +='        .ExternalClass,                                                                                                                                                                         '
+        cRetHtml +='        .ExternalClass p,                                                                                                                                                                       '
+        cRetHtml +='        .ExternalClass span,                                                                                                                                                                    '
+        cRetHtml +='        .ExternalClass font,                                                                                                                                                                    '
+        cRetHtml +='        .ExternalClass td,                                                                                                                                                                      '
+        cRetHtml +='        .ExternalClass div {                                                                                                                                                                    '
+        cRetHtml +='          line-height: 100%; }                                                                                                                                                                  '
+        cRetHtml +='        .apple-link a {                                                                                                                                                                         '
+        cRetHtml +='          color: inherit !important;                                                                                                                                                            '
+        cRetHtml +='          font-family: inherit !important;                                                                                                                                                      '
+        cRetHtml +='          font-size: inherit !important;                                                                                                                                                        '
+        cRetHtml +='          font-weight: inherit !important;                                                                                                                                                      '
+        cRetHtml +='          line-height: inherit !important;                                                                                                                                                      '
+        cRetHtml +='          text-decoration: none !important; }                                                                                                                                                   '
+        cRetHtml +='        .btn-primary table td:hover {                                                                                                                                                           '
+        cRetHtml +='          background-color: #34495e !important; }                                                                                                                                               '
+        cRetHtml +='        .btn-primary a:hover {                                                                                                                                                                  '
+        cRetHtml +='          background-color: #34495e !important;                                                                                                                                                 '
+        cRetHtml +='          border-color: #34495e !important; } }                                                                                                                                                 '
+        cRetHtml +='    </style>                                                                                                                                                                                    '
+        cRetHtml +='  </head>                                                                                                                                                                                       '
+        cRetHtml +='  <body class="">                                                                                                                                                                               '
+        cRetHtml +='    <table border="0" cellpadding="0" cellspacing="0" class="body">                                                                                                                             '
+        cRetHtml +='      <tr>                                                                                                                                                                                      '
+        cRetHtml +='        <td>&nbsp;</td>                                                                                                                                                                         '
+        cRetHtml +='        <td class="container">                                                                                                                                                                  '
+        cRetHtml +='          <div class="content">                                                                                                                                                                 '
+        cRetHtml +='                                                                                                                                                                                                '
+        cRetHtml +='            <!-- START CENTERED WHITE CONTAINER -->                                                                                                                                             '
+        cRetHtml +='                                                                                                                                                                                                '
+        cRetHtml +='            <table class="main">                                                                                                                                                                '
+        cRetHtml +='                                                                                                                                                                                                '
+        cRetHtml +='              <!-- START MAIN CONTENT AREA -->                                                                                                                                                  '
+        cRetHtml +='              <tr>                                                                                                                                                                              '
+        cRetHtml +='                <td class="wrapper">
+
+        cRetHtml +='                  <p>Olá.</p>
+        cRetHtml +='                  <p>Os títulos de ' + cTpTitulos + ' a seguir obtiveram erro na integração:</p>
+
+        cRetHtml +='                  <table border="1" cellpadding="0" cellspacing="0">
+        cRetHtml +='                      <thead>
+        cRetHtml +='                          <tr>
+        cRetHtml +='                              <th>Título</th>
+        cRetHtml +='                              <th>Prefixo</th>
+        cRetHtml +='                              <th>Cliente</th>
+        cRetHtml +='                              <th>Loja</th>
+        cRetHtml +='                              <th>Nome</th>
+        cRetHtml +='                              <th>Erro</th>
+        cRetHtml +='                          </tr>
+        cRetHtml +='                      </thead>
+        cRetHtml +='                      <tbody>
+        
+        For nX := 1 To Len(aDadosTitulo)
+            cRetHtml +='                          <tr>
+            cRetHtml +='                              <td>
+            cRetHtml +='                                  ' + AllTrim(aDadosTitulo[nX, 1]) + ' '
+            cRetHtml +='                              </td>
+            cRetHtml +='                              <td>
+            cRetHtml +='                                  ' + AllTrim(aDadosTitulo[nX, 2]) + ' '
+            cRetHtml +='                              </td>
+            cRetHtml +='                              <td>
+            cRetHtml +='                                  ' + AllTrim(aDadosTitulo[nX, 3]) + ' '
+            cRetHtml +='                              </td>
+            cRetHtml +='                              <td>
+            cRetHtml +='                                  ' + AllTrim(aDadosTitulo[nX, 4]) + ' '
+            cRetHtml +='                              </td>
+            cRetHtml +='                              <td>
+            cRetHtml +='                                  ' + AllTrim(Posicione("SA1", 1, FWxFilial("SA1")+aDadosTitulo[nX, 3] + aDadosTitulo[nX, 4], "A1_NOME")) + ' '
+            cRetHtml +='                              </td>
+            cRetHtml +='                              <td>
+            cRetHtml +='                                  strong>' + aDadosTitulo[nX, 5] + '</strong>
+            cRetHtml +='                              </td>
+            cRetHtml +='                          </tr>
+        Next
+
+        cRetHtml +='                      <tbody>
+        cRetHtml +='                  </table>
+        cRetHtml +='                </td>                                                                                                                                                                          '
+        cRetHtml +='              </tr>                                                                                                                                                                             '
+        cRetHtml +='                                                                                                                                                                                                '
+        cRetHtml +='            <!-- END MAIN CONTENT AREA -->                                                                                                                                                      '
+        cRetHtml +='            </table>                                                                                                                                                                            '
+        cRetHtml +='                                                                                                                                                                                                '
+        cRetHtml +='            <!-- START FOOTER -->                                                                                                                                                               '
+        cRetHtml +='            <div class="footer">                                                                                                                                                                '
+        cRetHtml +='              <table border="0" cellpadding="0" cellspacing="0">                                                                                                                                '
+        cRetHtml +='                <tr>                                                                                                                                                                            '
+        cRetHtml +='                  <td class="content-block powered-by">                                                                                                                                         '
+        cRetHtml +='                    Gerado Automaticamente integração com a Fast Connect.                                                                                                        '
+        cRetHtml +='                  </td>                                                                                                                                                                         '
+        cRetHtml +='                </tr>  			                                                                                                                                                             '
+        cRetHtml +='                <tr>                                                                                                                                                                            '
+        cRetHtml +='                  <td class="content-block powered-by">                                                                                                                                         '
+        cRetHtml +='                      ' + AllTrim(FWCompanyName())  + ' -  ' +  cValToChar(Year(Date())) +  '                '
+        cRetHtml +='                  </td>                                                                                                                                                                         '
+        cRetHtml +='                </tr>                                                                                                                                                                           '
+        cRetHtml +='              </table>                                                                                                                                                                          '
+        cRetHtml +='            </div>                                                                                                                                                                              '
+        cRetHtml +='            <!-- END FOOTER -->                                                                                                                                                                 '
+        cRetHtml +='                                                                                                                                                                                                '
+        cRetHtml +='          <!-- END CENTERED WHITE CONTAINER -->                                                                                                                                                 '
+        cRetHtml +='          </div>                                                                                                                                                                                '
+        cRetHtml +='        </td>                                                                                                                                                                                   '
+        cRetHtml +='        <td>&nbsp;</td>                                                                                                                                                                         '
+        cRetHtml +='      </tr>                                                                                                                                                                                     '
+        cRetHtml +='    </table>                                                                                                                                                                                    '
+        cRetHtml +='  </body>                                                                                                                                                                                       '
+        cRetHtml +='</html>          
+    EndIf
+
+Return cRetHtml
+
+/*/{Protheus.doc} BaixaTitulo
+    Realiza a baixa via Execauto do título
+    @type function
+    @version 1.0
+    @author Daniel Scheeren - Gruppe
+    @since 29/10/2021
+    @param cTipIntegracao, character, Tipo do título da Integração (Boleto ou crédito)
+    @param dDataBaixa, date, Data que será realizad a baixa (data é calculada com o dia posterior, pois é quando cai na conta)
+    @param nValorTotFast, numeric, Valor total da cobrança
+    @param nValorReceb, numeric, Valor recebido, já descontado a taxa da Fast Connect
+    @param nValorTaxa, numeric, Valor da taxa cobrada pela Fast
+    @param nValJuros, numeric, Valor de juros do vencimento
+    @param nValMulta, numeric, Valor da multa do vencimento
+    @param cNumFast, character, Código identificador da venda da Fast
+    @return variant, return_description
+    /*/
+Static Function BaixaTitulo(cTipIntegracao, dDataBaixa, dDataReceb, nValorTotFast, nValorReceb, nValorTaxa, nValJuros, nValMulta, cNumFast)
+
+    Local lRet          := .T.
+    // dados do título para baixa
+    Local aBaixa        := {}
+    Local aMovimBanc    := {}
+    // dados do título para log
+    Local aDadosLog     := {"","","","",""}
+    // históricos de baixa
+    Local cHistBoleto   := "REC TIT BOLETO"
+    Local cHistTarfBol  := "TARIFA BOLETO"
+    Local cHistCredito  := "REC TIT CARTAO"
+    Local cHistTarCred  := "TARIFA CARTAO"
+    // Local cHistDbAutat  := "REC TIT DÉBITO AUTOMÁTICO"
+    // data do recebimento, é realizado o recebimento no dia posterior (ou próximo dia útil), pois é quando a Fast realiza a transferência do valor para a conta
+    Local dDataCred     := dDataReceb//DataValida(dDataBaixa + 1, .T.) 
+    // natureza de operação da taxa
+    Local _cNaturezaTx  := SuperGetMV("MV_FCNATDP", .F., "0244")
+    // verifica se o valor do repasse é diferente d que o valor do título
+    Local nDifVlrRep    := (nValorTotFast + nValJuros + nValMulta) - (nValorReceb + nValorTaxa)
+    Local cMsgSucesso    := ""
+    // valor liquido do título (valor cobrado ao cliente)
+    Private lMsErroAuto := .F.
+
+    // dados do título para gravação do log
+    aDadosLog := {;
+        SE1->E1_NUM,;
+        SE1->E1_PREFIXO,;
+        SE1->E1_PARCELA,;
+        SE1->E1_CLIENTE,;
+        SE1->E1_LOJA,;
+        SE1->E1_TIPO;
+    }
+
+    // verifica se o valor recebido + taxa fast é igual ou superior ao valor cobrado ao cliente
+    // If nDifVlrRep != 0
+
+        // grava dados do banco para realizar a baixa
+        SE1->(RecLock("SE1", .F.))
+            SE1->E1_PORTADO := SuperGetMV("MV_FCBANCO", .F., "")
+            SE1->E1_AGEDEP  := SuperGetMV("MV_FCAGENC", .F., "")
+            SE1->E1_CONTA   := SuperGetMV("MV_FCCONTA", .F., "")
+        SE1->(MsUnlock())
+
+        // posiciona no banco e valida se o banco do parâmetro existe
+        DbSelectArea("SA6")
+        SA6->(DbSetOrder(1))    // 1- A6_FILIAL, A6_COD, A6_AGENCIA, A6_NUMCON
+        If SA6->(DbSeek(FWxFilial("SA6") + PadR(SE1->E1_PORTADO,TamSx3("A6_COD")[1]) + PadR(SE1->E1_AGEDEP,TamSx3("A6_AGENCIA")[1]) + PadR(SE1->E1_CONTA,TamSx3("A6_NUMCON")[1])))
+
+            Begin Transaction
+
+                // altera database para a data da baixa, pois está somando juros queando realizado em outros dias
+                dDataBase := dDataBaixa
+
+                // realiza a baixa do valor recebido
+                Aadd(aBaixa, {"E1_PREFIXO",		SE1->E1_PREFIXO     ,Nil})   // Prefixo
+                Aadd(aBaixa, {"E1_NUM",			SE1->E1_NUM		    ,Nil})   // Número
+                Aadd(aBaixa, {"E1_TIPO",		SE1->E1_TIPO		,Nil})   // Tipo
+                Aadd(aBaixa, {"E1_PARCELA",		SE1->E1_PARCELA	    ,Nil})   // Parcela
+                Aadd(aBaixa, {"AUTMOTBX",		"NOR"				,Nil})   // NOR=Normal
+                Aadd(aBaixa, {"AUTBANCO",		SA6->A6_COD	        ,Nil})   // Banco
+                Aadd(aBaixa, {"AUTAGENCIA",		SA6->A6_AGENCIA	    ,Nil})   // Agencia
+                Aadd(aBaixa, {"AUTCONTA",		SA6->A6_NUMCON		,Nil})   // Conta
+                Aadd(aBaixa, {"AUTDTBAIXA",		dDataBaixa			,Nil})   // Data da baixa
+                Aadd(aBaixa, {"AUTDTCREDITO",	dDataCred			,Nil})   // Data do crédito
+                If nValJuros == 0   // conforme documentação, enviar 4 posição quando valor zero para "forçar" considerar do execauto
+                    Aadd(aBaixa, {"AUTJUROS",       0			        ,Nil, .T.})   // Valor de Juros
+                Else
+                    Aadd(aBaixa, {"AUTJUROS",       nValJuros			,Nil})   // Valor de Juros
+                EndIF
+                If nValMulta == 0   // conforme documentação, enviar 4 posição quando valor zero para "forçar" considerar do execauto
+                    Aadd(aBaixa, {"AUTMULTA",       0			        ,Nil, .T.})   // Valor de Multa
+                Else
+                    Aadd(aBaixa, {"AUTMULTA",       nValMulta			,Nil})   // Valor de Multa
+                EndIf
+                If cTipIntegracao == "BOL"
+                    Aadd(aBaixa, {"AUTHIST",		cHistBoleto	    ,Nil})   // Observação
+                Else
+                    Aadd(aBaixa, {"AUTHIST",		cHistCredito    ,Nil})   // Observação
+                EndIf
+                // Aadd(aBaixa, {"AUTVALREC",		nValorReceb		    ,Nil})   // Valor
+                Aadd(aBaixa, {"E1_ZNUMFST",		cNumFast	        ,Nil})   // Código da venda na Fast
+
+                // execauto da baixa
+                MSExecAuto({|x, y| FINA070(x, y)}, aBaixa, 3)   // 3 - Baixa de Título, 5 - Cancelamento de baixa, 6 - Exclusão de Baixa.
+
+                // retorna data atual
+                dDataBase := Date()
+
+                // sucesso
+                If !lMsErroAuto
+
+                    cMsgSucesso := "Efetuado baixa do título."
+                    
+                    // verifica se o valor recebido + taxa fast é menor que o valor cobrado ao cliente, quer dizer que a fast fez um repasse de valor menor (por vezes ocorre da Fast cobrar taxa duplicada)
+                    If nDifVlrRep > 0
+                        
+                        cMsgSucesso := "Efetuado baixa do título, porém repasse é R$ " + AllTrim(Transform(nDifVlrRep, PesqPict("SE1", "E1_VALOR"))) + " inferior ao valor do título R$ " + AllTrim(Transform(nValorTotFast, PesqPict("SE1", "E1_VALOR"))) + "."
+                        // grava log
+                        U_FCLog(cTipIntegracao, aDadosLog, cMsgSucesso, "B", Nil, Nil, "Executado baixa do boleto automática via execauto.")
+                    EndIf
+
+                    // valida se há valor de taxa (valor pago a Fast) para efetuar movimentação bancária
+                    If nValorTaxa > 0
+
+                        lMsErroAuto := .F.
+                        aMovimBanc  := {}
+                        // altera database para a data do repasse
+                        dDataBase   := dDataBaixa
+
+                        Aadd(aMovimBanc, {"E5_DATA"       ,dDataCred           ,Nil})   // Data mov.
+                        Aadd(aMovimBanc, {"E5_MOEDA"      ,"M1"                ,Nil})   // Moeda
+                        Aadd(aMovimBanc, {"E5_VALOR"      ,nValorTaxa          ,Nil})   // Valor
+                        Aadd(aMovimBanc, {"E5_NATUREZ"    ,_cNaturezaTx        ,Nil})   // Natureza
+                        Aadd(aMovimBanc, {"E5_BANCO"      ,SA6->A6_COD         ,Nil})   // Banco
+                        Aadd(aMovimBanc, {"E5_AGENCIA"    ,SA6->A6_AGENCIA     ,Nil})   // Agencia
+                        Aadd(aMovimBanc, {"E5_CONTA"      ,SA6->A6_NUMCON      ,Nil})   // Conta
+                        Aadd(aMovimBanc, {"E5_VENCTO"     ,dDataCred           ,Nil})   // Vencimento
+                        Aadd(aMovimBanc, {"E5_BENEF"      ,"FAST CONNECT"      ,Nil})   // Beneficiário
+                        If cTipIntegracao == "BOL"
+                            Aadd(aMovimBanc, {"E5_HISTOR"     ,cHistTarfBol            ,Nil})   // Histórico
+                        Else
+                            Aadd(aMovimBanc, {"E5_HISTOR"     ,cHistTarCred           ,Nil})   // Histórico
+                        EndIf
+                        Aadd(aMovimBanc, {"E5_ZNUMFST",		cNumFast               ,Nil})   // Código da venda na Fast
+
+                        // gera um movimento a pagar 
+                        MSExecAuto({|x,y,z| FINA100(x,y,z)}, 0, aMovimBanc, 3)  // pagar
+                        
+                        // retorna data atual
+                        dDataBase := Date()
+                        
+                        // sucesso
+                        If !lMsErroAuto
+                            // grava log
+                            U_FCLog(cTipIntegracao, aDadosLog, "Gerado movimento da taxa.", "B", Nil, Nil, "Gerado movimentação bancária para a taxa do título via execauto.")
+
+                        // erro
+                        Else
+                            lRet := .F.
+                            MakeDir("C:\temp")
+                            // formata errolog para salvar no campo
+                            cErro := StrTran(MostraErro("C:\temp\", "error.log"), Chr(13)+Chr(10), "")
+                            DisarmTransaction()
+                            // grava log
+                            U_FCLog(cTipIntegracao, aDadosLog, "Erro no execauto de movimentação bancária da taxa.", "E", Nil, Nil, cErro)
+                        EndIf
+
+                    Else
+                        // grava log
+                        U_FCLog(cTipIntegracao, aDadosLog, "Efetuado baixa do título.", "B", Nil, Nil, "Executado baixa do boleto automática via execauto.")
+                    EndIf
+
+                // erro
+                Else
+                    lRet := .F.
+                    MakeDir("C:\temp")
+                    // formata errolog para salvar no campo
+                    cErro := StrTran(MostraErro("C:\temp\", "error.log"), Chr(13)+Chr(10), "")
+                    DisarmTransaction()
+                    // grava log
+                    U_FCLog(cTipIntegracao, aDadosLog, "Erro no execauto de baixa do boleto.", "E", Nil, Nil, cErro)
+                EndIf
+
+            End Transaction
+
+            // após gerar a baixa, grava o número da Fast no movimento
+            If !lMsErroAuto .and. !Empty(cNumFast)
+
+                DbSelectArea("SE5")
+                SE5->(DbSetOrder(7))    // 7- E5_FILIAL, E5_PREFIXO, E5_NUMERO, E5_PARCELA, E5_TIPO, E5_CLIFOR, E5_LOJA, E5_SEQ
+                If SE5->(DbSeek(FWxFilial("SE5") + SE1->(E1_PREFIXO + E1_NUM + E1_PARCELA + E1_TIPO + E1_CLIENTE + E1_LOJA)))
+                    RecLock("SE5", .F.)
+                        SE5->E5_ZNUMFST := cNumFast
+                    SE5->(MsUnlock())
+                EndIf
+
+            EndIf
+
+        // não encontrado banco
+        Else
+            lRet  := .F.
+            cErro := "Erro na baixa do título, não foi encontrado o banco informado, deve ser realizada a baixa manualmente."
+            // grava log
+            U_FCLog(cTipIntegracao, aDadosLog, cErro, "E")
+        EndIf
+
+    // valida se o valor do repasse está correto, deve ser o valor do título sem o valor da taxa
+    // Else
+    //     lRet  := .F.
+    //     cErro := "Título não baixado, valor do repasse (R$ " + AllTrim(Transform(nValorReceb, PesqPict("SE1", "E1_VALOR"))) + ") + taxa (R$ " + AllTrim(Transform(nValorTaxa, PesqPict("SE1", "E1_VALOR"))) + ") é inferior ao valor do título (R$ " + AllTrim(Transform(nValorTotFast, PesqPict("SE1", "E1_VALOR"))) + "). Diferença de (R$ " + AllTrim(Transform(nDifVlrRep, PesqPict("SE1", "E1_VALOR"))) + "). Verificar com a Fast."
+    //     // grava log
+    //     U_FCLog(cTipIntegracao, aDadosLog, cErro, "E")
+    // EndIf
+    
+
+    // grava log na tabela de baixas
+    DbSelectArea("Z08")
+    Z08->(DbSetOrder(1))    // 1- Z08_FILIAL, Z08_TITULO, Z08_PREFIX, Z08_PARCEL, Z08_CLIENT, Z08_LOJA, Z08_TIPTIT
+    If Z08->(DbSeek(FWxFilial("Z08") + aDadosLog[1] + aDadosLog[2] + aDadosLog[3] + aDadosLog[4] + aDadosLog[5]))
+        If lRet
+            RecLock("Z08", .F.)
+                Z08->Z08_STATUS := "B"  // Baixado
+                Z08->Z08_MENSAG := cMsgSucesso
+                Z08->Z08_VLRJUR := nValJuros
+                Z08->Z08_VLRMUL := nValMulta
+                Z08->Z08_TRY++
+            MsUnlock()
+        Else
+            RecLock("Z08", .F.)
+                Z08->Z08_STATUS := "E"  // Erro Baixa
+                Z08->Z08_MENSAG := "Erro na baixa do título: " + cErro
+                Z08->Z08_VLRJUR := nValJuros
+                Z08->Z08_VLRMUL := nValMulta
+                Z08->Z08_TRY++
+            MsUnlock()
+        EndIf
+    EndIf
+
+    
+Return lRet
+
+/*---------------------------------------------------------------------------+
+!                             FICHA TECNICA DO PROGRAMA                      !
++------------------+---------------------------------------------------------+
+!Descricao         ! Funcao que executa Query passada como parametro e       !
+!                  ! retorna o conteudo em um array.                         !
++------------------+---------------------------------------------------------+
+!Autor             ! Gruppe - Felipe José Limas                              !
++------------------+---------------------------------------------------------+
+!Data de Criacao   ! 07/2020                                                 !
++------------------+--------------------------------------------------------*/
+User Function SqlToVet(cQuery)
+
+    Local aRet    := {}
+    Local aRet1   := {}
+    Local nRegAtu := 0
+    Local x       := 0
+    Local _cAlias := GetNextAlias()
+
+    cQuery := ChangeQuery(cQuery)
+
+    dbUseArea(.T.,"TOPCONN",TCGenQry(,,cQuery),_cAlias,.T.,.T.)
+
+    (_cAlias)->(dbgotop())
+
+    aRet1   := Array(Fcount())
+    nRegAtu := 1
+
+	While !(_cAlias)->(Eof())
+
+		For x:=1 To Fcount()
+		    aRet1[x] := FieldGet(x)
+		Next
+	    
+        Aadd(aRet,aclone(aRet1))
+
+        (_cAlias)->(dbSkip())
+        nRegAtu += 1
+	Enddo
+
+	If Select(_cAlias) <> 0
+	    (_cAlias)->(dbCloseArea())
+	EndIf
+
+Return(aRet)
+
+
+/*/{Protheus.doc} FCCalcVlrTitulo
+    Calcula valor real a cobrar do cliente
+    @type function
+    @version 1.0
+    @author Daniel Scheeren - Gruppe
+    @since 29/08/2022
+    @return number, Valor do título
+    /*/
+// User Function FCCalcVlrTitulo()
+    
+//     Local nValorACobrar := 0
+
+//     DbSelectArea("SED")
+
+//     If cEmpAnt == "06"
+// 		nValorACobrar := SE1->(E1_SALDO + E1_ACRESC - E1_DECRESC - (E1_ISS + E1_CSLL + E1_COFINS + E1_INSS + E1_PIS + E1_IRRF))
+// 	Else
+//         SED->(DbSetOrder(1))    // 1- ED_FILIAL + ED_CODIGO
+//         If SED->(DbSeek(FWxFilial("SED") + SE1->E1_NATUREZ))
+// 		    If SED->ED_CALCISS == 'S'
+//                 nValorACobrar := SE1->(E1_SALDO + E1_ACRESC - E1_DECRESC - E1_ISS)
+//             Else
+//                 nValorACobrar := SE1->(E1_SALDO + E1_ACRESC - E1_DECRESC)
+// 	        EndIf
+// 	    EndIf
+// 	EndIf
+
+// Return nValorACobrar
+
+
+/*/{Protheus.doc} FCCalcVlrTaxa
+    Calcula valor de taxas cobradas pela Fast Connect
+        Bol = R$ 1,4
+        CC  = 2,4% do valor
+    @type function
+    @version 1.0
+    @author Daniel Scheeren - Gruppe
+    @since 29/08/2022
+    @param nValor, numeric, Valor do título
+    @param nTipTitulo, character, Tipo do título
+    @return variant, return_description
+    /*/
+User Function FCCalcVlrTaxa(nValor, nTipTitulo)
+
+    Local nValorTaxa := 0
+
+    Default nTipTitulo := "BOL"
+    Default nValor     := 0
+
+    // valor retido pela fast pela taxa cobrada
+    If nTipTitulo == "BOL"
+        // para boleto é um valor fixo
+        nValorTaxa := SuperGetMV("MV_FCTXBOL", .F., 1.4)
+    Else
+        // para crédito calcula percentual
+        nValorTaxa := Round(nValor * (SuperGetMV("MV_FCTXCC", .F., 2.4) / 100), TamSX3("E5_VALOR")[2])
+    EndIf
+    
+Return nValorTaxa
+
+
+/*/{Protheus.doc} FCRepasse
+    Envia o repasse do dia solicitado
+    @type function
+    @version 1.0
+    @author Daniel Scheeren - Gruppe
+    @since 04/11/2022
+    @return variant, return_description
+    /*/
+User Function FCRepasse()
+
+    Local lRet    := .T.
+    Local dData   := SToD("")
+	// verifica se é base teste ou produção para alterar endpoints
+    Local lBaseProducao := Upper(AllTrim(GetSrvProfString("dbalias", ""))) == "SIGAPROD"
+    Local cHost   := ""
+    Local cPath   := "/webhook/recebidos"
+    Local jBody   := JsonObject():New()
+    Local aHeader := {}
+	Local cToken  := SuperGetMV("MV_TOKENFC", .F., "")
+	Local cClient := SuperGetMV("MV_CLICOFC", .F., "")
+    
+    If lBaseProducao
+		cHost		:= "https://api.fpay.me"
+	Else
+		cHost		:= "https://api-sandbox.fpay.me"
+	EndIf
+
+    // cabeçalho de requisição
+    aAdd(aHeader, "Content-Type: application/json")
+    aAdd(aHeader, "Client-Code: " + cClient)
+    aAdd(aHeader, "Client-key: " + cToken)
+    
+    // seleção da data do repasse para reprocessamento
+	oWindow := FWDialogModal():New()
+	oWindow:SetBackground(.T.)
+	oWindow:SetTitle("Selecione a data de repasse para reprocessamento.")
+	//Seta a largura e altura da janela em pixel
+	oWindow:setSize(200, 200)
+	oWindow:EnableFormBar(.T.)
+	oWindow:SetCloseButton(.F.)
+	oWindow:SetEscClose(.F.)
+	oWindow:CreateDialog()
+	oWindow:AddCloseButton({|| oWindow:DeActivate() }, "Confirmar")
+	oWindow:AddButtons({{, "Cancelar", {|| lRet := .F., oWindow:DeActivate() }, "Cancelar", , .T., .F.}})
+
+	oPanel := oWindow:GetPanelMain()
+
+	TSay():New(005,005,{|| "Data: "}, oPanel,,,,,,.T.,,,30,20,,,,,,.T.)
+	oGet1 := TGet():New(015,005,{|u| If(PCount()>0,dData:=u,dData) },oPanel,050,010,'',{||  },CLR_BLACK,CLR_WHITE,,,,.T.,,,{|| },,,{||  },.F.,.F.,"SA6","dData",,,,.F.,.F.,,"", 2,,,,,)
+	
+	oWindow:Activate()
+
+    If lRet
+
+        jBody["data_conciliacao"] := Transform(DToS(dData), "@D 9999-99-99")
+
+        // endereço da integração
+        oRest := FWRest():New(cHost)
+
+        // path
+        oRest:SetPath(cPath)
+
+        // json com os dados de envio
+        oRest:SetPostParams("body")
+        oRest:SetPostParams(jBody:ToJson())
+        oRest:SetChkStatus(.T.)
+
+        // tenta efetuar o Post
+        If oRest:Post(aHeader)
+            FWAlertSuccess("Sucesso na solicitação de repasse para o dia " + DToC(dData) + ".")
+        Else
+            FWAlertError("Ocorreu um erro ao processar o repasse para o dia " + DToC(dData) + ". Favor entrar em contato com a Fast Connect.")
+        EndIf
+    EndIf
+
+Return lRet
+
+/*/{Protheus.doc} LogPend
+    Grava log do título em que está pendente de integração
+    @type function
+    @version 1.0
+    @author Daniel Scheeren - Gruppe
+    @since 4/24/2023
+    @param aDadosLog, array, Dados do título
+    @param dVencimento, date, Data de vencimento do título
+    /*/
+User Function FCLogPend(aDadosLog, dVencimento)
+
+    // indica quantidade de dias a considerar para integrar antes do vencimento e não pela emissão (se zero envia pela emissão)
+    Local nDiasAntesVcto := SuperGetMV("FC_DINTAVC", .F., 0)
+
+    If nDiasAntesVcto > 0
+        // calcula data de previsão de envio
+        dDataInt := dVencimento - nDiasAntesVcto
+        // grava log
+        U_FCLog("BOL", aDadosLog, "Título pendente de integração. Será integrado em " + DToC(dDataInt) + " conforme parâmetro FC_DINTAVC.", "P", "", Nil, "")
+    Else
+        // grava log
+        U_FCLog("BOL", aDadosLog, "Título pendente de integração.", "P", "", Nil, "")
+    EndIf
+    
+Return Nil

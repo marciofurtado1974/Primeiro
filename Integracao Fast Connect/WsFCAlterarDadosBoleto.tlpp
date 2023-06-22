@@ -1,0 +1,272 @@
+#include "Tlpp-Core.th"
+#include "Tlpp-Rest.th"
+#include "Protheus.ch"
+
+#Define WS_ENDPOINT 			"/boleto/"
+
+/*/{Protheus.doc} WsFCAlterarDadosBoleto
+    Integração para alteração de vencimento de títulos de boleto com a FastConnect
+    @type function
+    @version 1.0
+    @author Daniel Scheeren - Gruppe
+    @since 03/09/2021
+    /*/
+User Function WsFCAlterarDadosBoleto()
+
+	Local aHeader		:= {}				as array
+	Local _lRetOk		:= .T. 				as logical
+	Local oRest								as object
+	Local _cAliasTmp	:= GetNextAlias() 	as character
+	Local jJson								as json
+	Local jJsonRet							as json
+	Local aDadosLog		:= {"","","","",""}	as array
+	Local _nQtdBoletos	:= 0				as numeric
+	Local cJson 		:= ""				as character
+
+	// fecha tabela se aberta
+	If Select(_cAliasTmp) > 0
+		(_cAliasTmp)->(DbCloseArea())
+	EndIf
+
+	// busca títulos de boletos a receber
+	_cQuery := " SELECT E1_NUM "
+	_cQuery += " 		,E1_PREFIXO "
+	_cQuery += " 		,E1_PARCELA "
+	_cQuery += " 		,E1_CLIENTE "
+	_cQuery += " 		,E1_LOJA "
+	_cQuery += " 		,E1_TIPO "
+	_cQuery += " 		,E1_VENCREA AS VENCTO "
+	_cQuery += " 		,Z04_IDFAST AS FID "
+	_cQuery += " FROM " + RetSQLTab("SE1")
+	_cQuery += " 			INNER JOIN " + RetSQLTab("Z04")
+	_cQuery += " 			ON Z04_TITULO = E1_NUM"
+	_cQuery += " 			AND Z04_PREFIX = E1_PREFIXO"
+	_cQuery += " 			AND Z04_PARCEL = E1_PARCELA"
+	_cQuery += " 			AND Z04_CLIENT = E1_CLIENTE"
+	_cQuery += " 			AND Z04_LOJA   = E1_LOJA"
+	_cQuery += " 			AND " + RetSQLCond("Z04")
+	_cQuery += " WHERE " + RetSQLCond("SE1")
+	// somente pendentes de envio de alteração
+	_cQuery += " AND E1_ZSTATFC = 'A' "
+	_cQuery += " GROUP BY E1_NUM, E1_PREFIXO, E1_PARCELA, E1_CLIENTE, E1_LOJA, E1_TIPO, E1_VENCREA, Z04_IDFAST "
+
+	DbUseArea(.T., 'TOPCONN', TCGENQRY(,,_cQuery), (_cAliasTmp), .F., .T.)
+	(_cAliasTmp)->(DbGoTop())
+	// quantidade de envios
+	Count To _nQtdBoletos
+	(_cAliasTmp)->(DbGoTop())
+	
+	If _nQtdBoletos > 0
+
+		// grava log
+		U_FCLog("BOL", aDadosLog, "Iniciado processo de reenvio de títulos com alterações.")
+
+		// grava log
+		U_FCLog("BOL", aDadosLog, "Quantidade de boletos a serem cancelados: " + cValToChar(_nQtdBoletos))
+
+		// cabeçalho de requisição
+		aAdd(aHeader, "Content-Type: application/json")
+		aAdd(aHeader, "Client-Code: " + CLIENT_CODE)
+		aAdd(aHeader, "Client-key: " + TOKEN)
+
+		While ! (_cAliasTmp)->(Eof())
+
+			// dados do título para gravação do log
+			aDadosLog := {;
+				(_cAliasTmp)->E1_NUM,;
+				(_cAliasTmp)->E1_PREFIXO,;
+				(_cAliasTmp)->E1_PARCELA,;
+				(_cAliasTmp)->E1_CLIENTE,;
+				(_cAliasTmp)->E1_LOJA,;
+				(_cAliasTmp)->E1_TIPO;
+			}
+
+			// ----- processo de cancelamento do título na Fast
+			
+			// endereço da integração
+			oRest	:= FWRest():New(HOST)
+
+			// path + parâmetro
+			oRest:SetPath(EncodeUtf8(WS_ENDPOINT + AllTrim((_cAliasTmp)->FID)))
+
+			// json com os dados de envio
+			oRest:SetChkStatus(.T.)
+
+			// verifica se o título já foi cadastrado na Fast para efetuar o delete
+			If oRest:Get(aHeader)
+
+				jJson    := JsonObject():New()
+				// resgata a resposta do JSON
+				jJson:FromJson(DecodeUTF8(oRest:GetResult()))
+
+				// valida se obteve sucesso na busca
+				If jJson['success'] .and. jJson:HasProperty("data")
+				
+					// valida se o título já não esta cancelado, pago (pode ainda não ter entrado o repasse do pagamento) ou vencido na Fast
+					If !(Upper(jJson['data']["situacao"]) == "CANCELADO") .and. !(Upper(jJson['data']["situacao"]) == "PAGO")// .and. !(Upper(jJson['data']["situacao"]) == "VENCIDO")
+
+						// tenta efetuar o Post
+						If oRest:Delete(aHeader)
+
+							jJson    := JsonObject():New()
+							jJsonRet := JsonObject():New()
+
+							// resgata a resposta do JSON
+							jJson:FromJson(DecodeUTF8(oRest:GetResult()))
+
+							// recebe o retorno
+							_lRetOk  := jJson['success']
+
+							// dados de retorno
+							jJsonRet:FromJson(AllTrim(jJson['data']:ToJson()))
+
+							// tabela de integração de título x fastconnect
+							U_FCGravaDadosRetorno("boleto", aDadosLog, jJsonRet, _lRetOk, Nil, Nil, "P")
+							
+							// grava log
+							U_FCLog("BOL", aDadosLog, "Sucesso no cancelamento do boleto.", "C", "", jJsonRet, "")
+						Else
+							jJsonRet := JsonObject():New()
+							_lRetOk  := .F.
+
+							// Resgata a resposta do JSON
+							jJsonRet:FromJson(AllTrim(oRest:GetResult()))
+
+							// código de erro
+							cErro := "[" + DecodeUTF8(AllTrim(oRest:GetLastError())) + "]"
+
+							// extrai mensagens do json de retorno
+							cErroMsg := U_FCFormataErrosRetorno(jJsonRet)
+
+							// valida se retornou msg, se não retornar ainda não está disponível para acesso (há um tempo até entrar no sistema)
+							If !Empty(cErroMsg)
+								cErro += cErroMsg
+							Else
+								cErro += " - Ocorreu um erro inesperado ao cancelar o boleto. Será efetuada nova tentativa de cancelamento."
+							EndIf
+
+							// validação para boletos assinatura que foram cancelados pelo CRM, ao retornar da consulta aparecem como ativos e fica em loop
+							If "Este boleto está cancelado" $ cErro
+								_lRetOk  := .T.
+
+								// dados de retorno
+								jJsonRet:FromJson(AllTrim(jJson['data']:ToJson()))
+
+								// tabela de integração de título x fastconnect
+								U_FCGravaDadosRetorno("boleto", aDadosLog, jJsonRet, _lRetOk, Nil, Nil, "P")
+								
+								// grava log
+								U_FCLog("BOL", aDadosLog, "Boleto já cancelado, será reenviado em seguida.", "C", "", jJsonRet, "")
+							Else
+
+								// tabela de integração de título x fastconnect
+								U_FCGravaDadosRetorno("boleto", aDadosLog, jJsonRet, _lRetOk, .T., Nil, "A")
+								
+								// grava log
+								U_FCLog("BOL", aDadosLog, "Erro no cancelamento do boleto.", "E", "", jJsonRet, cErro)
+							EndIf
+						EndIf
+
+					// já pago, não é possível realizar alteração do título
+					ElseIf (Upper(jJson['data']["situacao"]) == "PAGO")
+						jJson    := JsonObject():New()
+						jJsonRet := JsonObject():New()
+
+						// resgata a resposta do JSON
+						jJson:FromJson(DecodeUTF8(oRest:GetResult()))
+
+						// recebe o retorno
+						_lRetOk  := jJson['success']
+
+						// dados de retorno
+						jJsonRet:FromJson(AllTrim(jJson['data']:ToJson()))
+
+						// tabela de integração de título x fastconnect
+						U_FCGravaDadosRetorno("boleto", aDadosLog, jJsonRet, _lRetOk, Nil, Nil, "R")
+						
+						// grava log
+						U_FCLog("BOL", aDadosLog, "Boleto já pago, aguardando baixa. Portanto não será reenviado.", "E", "", jJsonRet, "")
+
+					// vencido, somente marca como pendente para reenvio
+					// ElseIf (Upper(jJson['data']["situacao"]) == "VENCIDO")
+					// 	jJson    := JsonObject():New()
+					// 	jJsonRet := JsonObject():New()
+
+					// 	// resgata a resposta do JSON
+					// 	jJson:FromJson(DecodeUTF8(oRest:GetResult()))
+
+					// 	// recebe o retorno
+					// 	_lRetOk  := jJson['success']
+
+					// 	// dados de retorno
+					// 	jJsonRet:FromJson(AllTrim(jJson['data']:ToJson()))
+
+					// 	// tabela de integração de título x fastconnect
+					// 	U_FCGravaDadosRetorno("boleto", aDadosLog, jJsonRet, _lRetOk, Nil, Nil, "P")
+						
+					// 	// grava log
+					// 	U_FCLog("BOL", aDadosLog, "Boleto vencido, não é necessário cancelamento. Será reenviado em seguida.", "C", "", jJsonRet, "")
+
+					// já cancelado, somente marca como pendente para reenvio
+					Else
+						jJson    := JsonObject():New()
+						jJsonRet := JsonObject():New()
+
+						// resgata a resposta do JSON
+						jJson:FromJson(DecodeUTF8(oRest:GetResult()))
+
+						// recebe o retorno
+						_lRetOk  := jJson['success']
+
+						// dados de retorno
+						jJsonRet:FromJson(AllTrim(jJson['data']:ToJson()))
+
+						// tabela de integração de título x fastconnect
+						U_FCGravaDadosRetorno("boleto", aDadosLog, jJsonRet, _lRetOk, Nil, Nil, "P")
+						
+						// grava log
+						U_FCLog("BOL", aDadosLog, "Boleto já cancelado, será reenviado em seguida.", "C", "", jJsonRet, "")
+					EndIf
+
+				// erro no retorno da consulta
+				Else
+					jJson    := JsonObject():New()
+					jJsonRet := JsonObject():New()
+
+					// resgata a resposta do JSON
+					jJson:FromJson(DecodeUTF8(oRest:GetResult()))
+
+					// recebe o retorno
+					_lRetOk  := jJson['success']
+
+					// dados de retorno
+					jJsonRet:FromJson(AllTrim(jJson['data']:ToJson()))
+
+					// tabela de integração de título x fastconnect
+					U_FCGravaDadosRetorno("boleto", aDadosLog, jJsonRet, _lRetOk, Nil, Nil, "X")
+					
+					// grava log
+					U_FCLog("BOL", aDadosLog, "Houve um erro na consulta do Boleto para cancelamento.", "X", "", jJsonRet, "")
+				EndIf
+			Else
+				jJsonRet := JsonObject():New()
+				// Resgata a resposta do JSON
+				jJsonRet:FromJson(AllTrim(oRest:GetResult()))
+				U_FCLog("BOL", aDadosLog, "Boleto ainda não está disponível para cancelamento.", "A", "", jJsonRet)
+			EndIf
+
+			(_cAliasTmp)->(DbSkip())
+		End
+	
+		// grava log
+		U_FCLog("BOL", {"","","","",""}, "Finalizado processo de alteração de vencimento de boletos.")
+
+	EndIf
+
+	// fecha tabela
+	If Select(_cAliasTmp) > 0
+		(_cAliasTmp)->(DbCloseArea())
+	EndIf
+
+Return Nil
+

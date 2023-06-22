@@ -1,0 +1,412 @@
+#include "Tlpp-Core.th"
+#include "Tlpp-Rest.th"
+#include "Protheus.ch"
+
+// realiza o pagamento com um token do cartão, quando já há registro dos dados do cartão
+#Define WS_ENDPOINT_DSTOKEN 	"/credito"
+// gera um link para pagamento do cliente (onde é digitado os dados de cartão)
+#Define WS_ENDPOINT_SEM_DSTOKEN "/link"
+
+/*/{Protheus.doc} WsFCGerarPgtoCC
+    Integração de títulos de cartão de crédito com a FastConnect
+    @type function
+    @version 1.0
+    @author Daniel Scheeren - Gruppe
+    @since 14/10/2021
+    /*/
+User Function WsFCGerarPgtoCC()
+
+	Local aHeader		:= {}				as array
+	Local _lRetOk		:= .T. 				as logical
+	Local oRest								as object
+	Local _cAliasTmp	:= GetNextAlias() 	as character
+	Local jJsonRet							as json
+	Local jJsonEnvio						as json
+	Local jJsonData							as json
+	// Local cDataVncto	:= ""				as character
+	Local aDadosLog		:= {}				as array
+	Local _nQtdCC		:= 0				as numeric
+	// Local cJson 		:= ""				as character
+	Local cChave		:= ""				as character
+	Local nX
+	// verifica se é base teste ou produção para alterar endpoints
+    Local lBaseProducao := Upper(AllTrim(GetSrvProfString("dbalias", ""))) == "SIGAPROD"
+
+	If lBaseProducao
+		// url de retorno base produção
+		cURLRetorno := SuperGetMV("FC_WSRETCC", .F., "http://erp.grupokhronos.com.br:9090/rest/pagamento/credito")
+	Else
+		// url de retorno base teste
+		cURLRetorno := "http://erp.grupokhronos.com.br:9093/rest/pagamento/credito"
+	EndIf
+	
+
+	// fecha tabela se aberta
+	If Select(_cAliasTmp) > 0
+		(_cAliasTmp)->(DbCloseArea())
+	EndIf
+
+	// busca títulos de cobranças de cartão de crédito
+	_cQuery := " SELECT E1_NUM "
+	_cQuery += " 		,E1_PREFIXO "
+	_cQuery += " 		,E1_CLIENTE "
+	_cQuery += " 		,E1_LOJA "
+	_cQuery += " 		,E1_TIPO "
+	// busca primeira parcela
+	_cQuery += " 		,min(E1_PARCELA) as E1_PARCELA "
+	_cQuery += " 		,count(E1_PARCELA) as NPARCELAS "
+	// se a natureza do título retem ISS, subtrai no valor do boleto
+	// KME
+	If cEmpAnt == "06"
+		_cQuery += " 		,sum(SE1.E1_SALDO + SE1.E1_ACRESC - SE1.E1_DECRESC - (SE1.E1_ISS + SE1.E1_CSLL + SE1.E1_COFINS + SE1.E1_INSS + SE1.E1_PIS + SE1.E1_IRRF)) AS TOTAL "
+	Else
+		_cQuery += " 		,sum((CASE WHEN ED_CALCISS = 'S' THEN (SE1.E1_SALDO + SE1.E1_ACRESC - SE1.E1_DECRESC - SE1.E1_ISS) ELSE (SE1.E1_SALDO + SE1.E1_ACRESC - SE1.E1_DECRESC) END)) AS TOTAL "
+	EndIf
+	// _cQuery += " 		,E1_VENCREA AS VENCTO "
+	_cQuery += " 		,A1_NOME "
+	_cQuery += " 		,A1_NREDUZ "
+	_cQuery += " 		,A1_CGC "
+	_cQuery += " 		,TRIM(A1_EMAIL) as A1_EMAIL "
+	_cQuery += " 		,A1_DDD "
+	_cQuery += " 		,A1_TEL "
+	_cQuery += " 		,A1_CEP "
+	_cQuery += " 		,A1_END "
+	_cQuery += " 		,A1_BAIRRO "
+	_cQuery += " 		,A1_COMPLE "
+	_cQuery += " 		,A1_MUN "
+	_cQuery += " 		,A1_EST "
+	_cQuery += " 		,A1_ZCCTOKE "
+	// _cQuery += " 		,COUNT(E1_PARCELA) AS PARCELAS "
+	_cQuery += " FROM " + RetSQLTab("SE1") + ", " + RetSQLTab("SED") + ", " + RetSQLTab("SA1")
+	_cQuery += " WHERE " + RetSQLCond("SE1")
+	_cQuery += " AND " + RetSQLCond("SA1")
+	_cQuery += " AND " + RetSQLCond("SED")
+	// cartão de crédito
+	// _cQuery += " AND E1_TIPO    = 'CC' "
+	// somente pendentes ou reenvio
+	_cQuery += " AND E1_ZSTATFC = 'P' "
+	// não baixado
+	_cQuery += " AND E1_SALDO   > 0 "
+	// ***** AS REGRAS ABAIXO SE ALTERADAS DEVEM SER REPLICADAS TAMBÉM PARA A INTEGRAÇÃO DA EXCELÊNCIA (WsEXEnviarTitulosVencidos e WsEXCancelarCobrancaTitulos) *****
+	// verifica se a orgiem for NF e se já possui o número da NF (pois é realizado consulta de NFSe que grava no campo E1_NFELETR)
+	// ou se não possuir o campo preenchido verifica se existe a nota no SF2 e se está autorizada
+	If lBaseProducao	// somente base de produção
+		_cQuery += " AND (CASE "
+		_cQuery += " 		WHEN TRIM(E1_ORIGEM) = 'MATA460' AND (TRIM(E1_NFELETR) <> ' ' OR TRIM((SELECT F2_DOC FROM " + RetSQLTab("SF2") + " WHERE " + RetSQLCond("SF2") + " AND F2_DOC = E1_NUM AND F2_SERIE = E1_SERIE AND F2_CLIENTE = E1_CLIENTE AND F2_LOJA = E1_LOJA AND TRIM(F2_FIMP) = 'S')) <> ' ') "
+		_cQuery += " 			THEN 1 "
+		_cQuery += " 		ELSE (CASE "
+		_cQuery += " 				WHEN TRIM(E1_ORIGEM) <> 'MATA460' "
+		_cQuery += " 					THEN 1 "
+		_cQuery += " 				ELSE 0 "
+		_cQuery += " 			END) "
+		_cQuery += " 		END) = 1 "
+	EndIf
+	// verifica se título veio de contrato e verifica o tipo de pagamento pelo contrato
+	_cQuery += " AND (CASE WHEN TRIM(E1_TIPO) = 'NF' AND TRIM(E1_CONTKHR) <> '' "
+	_cQuery += " 		THEN "
+	// busca o contrato e verifica a forma de pagamento se é CC
+	_cQuery += " 			(CASE WHEN (SELECT TRIM(ZC_FORMA) FROM " + RetSQLTab("SZC") + " WHERE " + RetSQLCond("SZC") + " AND ZC_NUM = E1_CONTKHR) = 'CC' THEN 1 ELSE 0 END)
+	// tudo que for cartão de crédito
+	_cQuery += " 		ELSE (CASE WHEN TRIM(E1_ORIGEM) <> 'MATA460' AND E1_TIPO = 'CC'
+	_cQuery += " 				THEN 1 
+	_cQuery += " 				ELSE 0 
+	_cQuery += " 			END) 
+	_cQuery += " 		END) = 1 "
+	_cQuery += " AND A1_COD     = E1_CLIENTE "
+	_cQuery += " AND A1_LOJA    = E1_LOJA "
+	_cQuery += " AND E1_NATUREZ = ED_CODIGO "
+	_cQuery += " GROUP BY E1_NUM, E1_PREFIXO, E1_CLIENTE, E1_LOJA, E1_TIPO, A1_NOME, A1_NREDUZ, A1_CGC, A1_EMAIL, A1_DDD, A1_TEL, A1_CEP, A1_END, A1_BAIRRO, A1_COMPLE, A1_MUN, A1_EST, A1_ZCCTOKE "
+
+	_cQuery := ChangeQuery(_cQuery)
+	DbUseArea(.T., 'TOPCONN', TCGENQRY(,,_cQuery), (_cAliasTmp), .F., .T.)
+	(_cAliasTmp)->(DbGoTop())
+	// quantidade de envios
+	Count To _nQtdCC
+	(_cAliasTmp)->(DbGoTop())
+
+	If _nQtdCC > 0
+
+		// grava log
+		Conout("Iniciado processo de envio de cobrança de crédito. - [WsFCGerarPgtoCC]")
+
+		// grava log
+		// U_FCLog("CC", {"","","","",""}, "Quantidade de cobranças de crédito a serem enviados: " + cValToChar(_nQtdCC))
+
+		// cabeçalho de requisição
+		aAdd(aHeader, "Content-Type: application/json")
+		aAdd(aHeader, "Client-Code: " + CLIENT_CODE)
+		aAdd(aHeader, "Client-key: " + TOKEN)
+
+		While ! (_cAliasTmp)->(Eof())
+
+			aDadosLog := {}
+
+			// seleciona todas as parcelas para gravação de status e log
+			// se possuir somente uma parcela é cobrança avulsa se houverem mais parcelas do mesmo título é envia parcelado
+			_cQuery := " SELECT E1_PARCELA "
+			_cQuery += " FROM " + RetSQLTab("SE1")
+			_cQuery += " WHERE " + RetSQLCond("SE1")
+			// somente pendentes ou reenvio
+			_cQuery += " AND E1_ZSTATFC = 'P' "
+			// não baixado
+			_cQuery += " AND E1_SALDO   > 0 "
+			_cQuery += " AND E1_PREFIXO = '" + (_cAliasTmp)->E1_PREFIXO + "' "
+			_cQuery += " AND E1_NUM 	= '" + (_cAliasTmp)->E1_NUM + "' "
+			_cQuery += " AND E1_TIPO 	= '" + (_cAliasTmp)->E1_TIPO + "' "
+			_cQuery += " AND E1_CLIENTE = '" + (_cAliasTmp)->E1_CLIENTE + "' "
+			_cQuery += " AND E1_LOJA 	= '" + (_cAliasTmp)->E1_LOJA + "' "
+
+			// gera array das parcelas
+			aRetParcelasCC := U_KHR00G01(_cQuery)
+
+			// dados do(s) título(s) para gravação do log
+			For nX := 1 To Len(aRetParcelasCC)
+				AAdd(aDadosLog, {;
+					(_cAliasTmp)->E1_NUM,;
+					(_cAliasTmp)->E1_PREFIXO,;
+					aRetParcelasCC[nX, 1],;		// parcela
+					(_cAliasTmp)->E1_CLIENTE,;
+					(_cAliasTmp)->E1_LOJA,;
+					(_cAliasTmp)->E1_TIPO;
+				})
+			Next
+
+			// formata data de vencimento
+			// cDataVncto := SubStr((_cAliasTmp)->VENCTO, 1, 4) + "-" + SubStr((_cAliasTmp)->VENCTO, 5, 2) + "-" + SubStr((_cAliasTmp)->VENCTO, 7, 2)
+
+			// chave de referencia
+			// aqui se houver parcelamento (mais de uma parcela do mesmo título) gera a referência com a primeira parcela para localização
+			cChave := FwCodEmp() + FwCodFil() + (_cAliasTmp)->E1_NUM + (_cAliasTmp)->E1_PREFIXO + (_cAliasTmp)->E1_PARCELA + (_cAliasTmp)->E1_CLIENTE + (_cAliasTmp)->E1_LOJA + (_cAliasTmp)->E1_TIPO
+
+			// verifica se possui mais de um e-mail para enviar somente o primeiro
+			nMultEmail := At(";", AllTrim((_cAliasTmp)->A1_EMAIL)) -1
+			// separa os demais e-mail para enviar como cópia
+			cEmailCC := If(nMultEmail > 0, AllTrim(SubStr((_cAliasTmp)->A1_EMAIL, At(";", AllTrim((_cAliasTmp)->A1_EMAIL)))), "")
+			
+			// endereço da integração
+			oRest := FWRest():New(HOST)
+			
+			// JSON
+			jJsonEnvio  := JsonObject():New()
+			jJsonEnvio['nu_referencia'] 	:= cChave
+			jJsonEnvio['nu_documento'] 		:= AllTrim((_cAliasTmp)->A1_CGC)
+			jJsonEnvio['url_retorno'] 		:= cURLRetorno
+			// jJsonEnvio['nu_parcelas'] 		:= (_cAliasTmp)->NPARCELAS
+			jJsonEnvio['ds_cep'] 			:= AllTrim((_cAliasTmp)->A1_CEP)
+			jJsonEnvio['ds_endereco'] 		:= EncodeUtf8(AllTrim((_cAliasTmp)->A1_END))
+			jJsonEnvio['ds_bairro'] 		:= EncodeUtf8(AllTrim((_cAliasTmp)->A1_BAIRRO))
+			jJsonEnvio['ds_complemento'] 	:= EncodeUtf8(AllTrim((_cAliasTmp)->A1_COMPLE))
+			jJsonEnvio['ds_numero'] 		:= 0
+			jJsonEnvio['nm_cidade'] 		:= EncodeUtf8(AllTrim((_cAliasTmp)->A1_MUN))
+			jJsonEnvio['nm_estado'] 		:= EncodeUtf8(AllTrim((_cAliasTmp)->A1_EST))
+			jJsonEnvio['email_cc'] 			:= ""
+			If nMultEmail > 0
+				jJsonEnvio['ds_email'] 		:= EncodeUtf8(SubStr(AllTrim((_cAliasTmp)->A1_EMAIL), 1, nMultEmail))
+				// cópia de e-mail
+				If !Empty(cEmailCC) .and. cEmailCC != ";"
+					jJsonEnvio['email_cc'] 	:= EncodeUtf8(cEmailCC)
+				EndIf
+			Else
+				jJsonEnvio['ds_email'] 		:= EncodeUtf8(AllTrim((_cAliasTmp)->A1_EMAIL))
+			EndIf
+			jJsonEnvio['nu_telefone'] 		:= StrTran(StrTran(If(Len(AllTrim((_cAliasTmp)->A1_DDD)) == 3, SubStr((_cAliasTmp)->A1_DDD, 2, 2), AllTrim((_cAliasTmp)->A1_DDD)) + AllTrim((_cAliasTmp)->A1_TEL), "-", ""), " ", "")
+			jJsonEnvio['vl_total'] 			:= (_cAliasTmp)->TOTAL
+			jJsonEnvio['ds_softdescriptor']	:= Left("KHRONOS " + Upper(AllTrim(FWEmpName(cEmpAnt, cFilAnt))), 13)	// informação da compra no extrato do cartão (maximo 13 caracteres)
+
+			jJsonEnvio['nm_cliente'] 		:= EncodeUtf8(SubStr(AllTrim((_cAliasTmp)->A1_NOME), 1, 40))
+			jJsonEnvio['slug'] 				:= Embaralha(StrTran(cChave, " ", ""), 1)	// Endereço final do link para pagamento
+			// jJsonEnvio['slug'] 			:= FwUUIDV4(.T.)	// Endereço final do link para pagamento
+			jJsonEnvio['dt_validade'] 		:= nil						// Validade do link (expirar em uma data)
+			jJsonEnvio['nu_max_pagamentos'] := nil
+			jJsonEnvio['tp_quantidade'] 	:= .F.
+			
+			jJsonEnvio['tp_credito'] 		:= .T.
+			jJsonEnvio['tp_pagamento_credito'] 		:= If((_cAliasTmp)->NPARCELAS == 1, "AV", "PL")	// AV = Avista; PL = Parcelado pela Loja (não gera assinatura)
+			jJsonEnvio['nu_max_parcelas_credito'] 	:= (_cAliasTmp)->NPARCELAS		// cliente pode selecionar no máximo em 1x o pagamento
+			jJsonEnvio['dia_cobranca_credito'] 		:= Nil		// define o dia do mês para a cobrança
+			jJsonEnvio['tp_nu_parcela_fixo'] 		:= "S"		// define que o cliente não pode alterar o numero de parcelas para pagar (devido ao "de para" com os títulos do protheus)
+
+			// valida se possui token, se já token já foi cadastrado os dados do cartão na Fast anteriormente e só necessita enviar o token para realizar a cobrança
+			If !Empty((_cAliasTmp)->A1_ZCCTOKE)
+				jJsonEnvio['ds_cartao_token'] := AllTrim((_cAliasTmp)->A1_ZCCTOKE)
+				// jJsonEnvio['nu_documento'] 	  := AllTrim((_cAliasTmp)->A1_CGC)
+				// jJsonEnvio['nm_cliente'] 	  := EncodeUtf8(SubStr(AllTrim((_cAliasTmp)->A1_NOME), 1, 40))
+				jJsonEnvio['tipo_venda'] 		:= If((_cAliasTmp)->NPARCELAS == 1, "AV", "PL")	// AV = Avista; PL = Parcelado pela Loja (não gera assinatura)
+
+				// path para pagamento com token
+				oRest:SetPath(WS_ENDPOINT_DSTOKEN)
+			
+			// se nã há token, gera um link onde o cliente irá informar os dados do cartão para pagamento
+			Else
+
+				// jJsonEnvio['slug'] 			:= Embaralha(StrTran(cChave, " ", ""), 1)	// Endereço final do link para pagamento
+				// jJsonEnvio['dt_validade'] 	:= nil						// Validade do link (expirar em uma data)
+				// jJsonEnvio['nu_max_pagamentos'] := nil
+				// jJsonEnvio['tp_quantidade'] := .F.
+				
+				// jJsonEnvio['tp_credito'] 	:= .T.
+				// jJsonEnvio['tp_pagamento_credito'] 	:= If((_cAliasTmp)->NPARCELAS == 1, "AV", "PL")	// AV = Avista; PL = Parcelado pela Loja (não gera assinatura)
+				// jJsonEnvio['nu_max_parcelas_credito'] := 1		// cliente pode selecionar no máximo em 1x o pagamento
+				// jJsonEnvio['dia_cobranca_credito'] 	:= nil
+				
+				// path para geração de link de pagamento
+				oRest:SetPath(WS_ENDPOINT_SEM_DSTOKEN)
+
+			EndIf
+
+			// path para pagamento com token
+			// oRest:SetPath(WS_ENDPOINT_SEM_DSTOKEN)
+
+			// json com os dados de envio
+			oRest:SetPostParams("body")
+			oRest:SetPostParams(jJsonEnvio:ToJson())
+			oRest:SetChkStatus(.T.)
+
+			// tenta efetuar o Post
+			If oRest:Post(aHeader)
+
+				jJsonRet  := JsonObject():New()
+				jJsonData := JsonObject():New()
+
+				// Resgata a resposta do JSON
+				jJsonRet:FromJson(DecodeUTF8(oRest:GetResult()))
+
+				// recebe o retorno
+				_lRetOk  := jJsonRet['success']
+
+				// dados de retorno
+				jJsonData:FromJson(AllTrim(jJsonRet['data']:ToJson()))
+
+				// só envia e-mail de registro de cartão, se houver token o cartão já foi registrado
+				// valida se gerou link de pagamento, quando há token o pagamento é efetuado diretamente
+				If Empty((_cAliasTmp)->A1_ZCCTOKE) .and. jJsonData:HasProperty('url_link') .and. !Empty(jJsonData['url_link'])
+					// envia e-mail com os dados para pagamento do cliente
+					MailCliCC(jJsonEnvio['ds_email'], jJsonEnvio['email_cc'], (_cAliasTmp)->A1_NOME, jJsonEnvio['nu_parcelas'], jJsonEnvio['vl_total'], jJsonData['url_link'])
+				EndIf
+				
+				// altera status em todas as parcelas
+				For nX := 1 To Len(aDadosLog)
+					// tabela de integração de título x fastconnect
+					U_FCGravaDadosRetorno("credito", aDadosLog[nX], jJsonData, _lRetOk, .T., Nil, "R")
+
+					// grava log
+					U_FCLog("CC", aDadosLog[nX], "Sucesso no envio da cobrança de crédito " + If(Len(aDadosLog) > 1, "parcelado", "avista") + ".", "R", jJsonEnvio:ToJson(), jJsonData, "")
+				Next
+				
+			Else
+				jJsonRet := JsonObject():New()
+				_lRetOk  := .F.
+
+				// Resgata a resposta do JSON
+				jJsonRet:FromJson(AllTrim(oRest:GetResult()))
+
+				// código de erro
+				cErro := DecodeUTF8(AllTrim(oRest:GetLastError()))
+
+				// extrai mensagens do json de retorno
+				cErro += U_FCFormataErrosRetorno(jJsonRet)
+
+				// altera status em todas as parcelas
+				For nX := 1 To Len(aDadosLog)
+					// tabela de integração de título x fastconnect
+					U_FCGravaDadosRetorno("credito", aDadosLog[nX], jJsonRet, _lRetOk, .T., Nil, "E")
+
+					// grava log
+					U_FCLog("CC", aDadosLog[nX], "Erro no envio de cobrança de crédito " + If(Len(aDadosLog) > 1, "parcelado", "avista") + ".", "E", jJsonEnvio:ToJson(), jJsonRet, cErro)
+
+				Next
+
+				// envia e-mail do erro
+				U_FCEnvioDeEMail(aDadosLog[1], "CC")
+			EndIf
+
+			(_cAliasTmp)->(DbSkip())
+		End
+	
+		// grava log
+		Conout("Finalizado processo de envio de cobrança de crédito. - [WsFCGerarPgtoCC]")
+
+	EndIf
+
+	// fecha tabela
+	If Select(_cAliasTmp) > 0
+		(_cAliasTmp)->(DbCloseArea())
+	EndIf
+
+Return Nil
+
+
+/*/{Protheus.doc} MailCliCC
+	Envio de e-mail com as informações e link para pagamento via cartão de crédito ao cliente
+    @type function
+	@version 1.0
+	@author Daniel Scheeren - Gruppe
+	@since 02/06/2022
+	@param cEmailCli, character, E-mail do cliente
+	@param cNomeCli, character, Nome do cliente
+	@param cNomeFantasiaCli, character, Nome Fantasia do cliente
+	@param nParcela, numeric, Numero da parcela
+	@param nTotParcelas, numeric, Numero total de parcelas
+	@param nVlrVenda, numeric, Valor da parcela
+	@param cLinkPgto, character, Link de pagamento
+	@return variant, return_description
+	/*/
+Static Function MailCliCC(cEmailCli, cEmailCliCC, cNomeCli, nTotParcelas, nVlrVenda, cLinkPgto)
+
+    Local oProcess, oHtml
+	Local cTelefoneContato := SuperGetMV("FC_CONTTEL", .F., "")
+	Local cEmailContato    := SuperGetMV("FC_CONTEML", .F., "")
+	Local cLogoEmpresa	   := SuperGetMV("FC_EMPLOGO", .F., "https://static.fastconnect.com.br/clients/1/images/emails/fast-logo-h-500.png.png")
+	Local cLogoFast 	   := SuperGetMV("FC_FSTLOGO", .F., "https://static.fastconnect.com.br/clients/1/images/emails/fast-logo-500x175.png.png")
+	Local aDadosFilial 	   := FWArrFilAtu(cEmpAnt, cFilAnt)
+	Local cNomeFantasia    := EncodeUtf8(Upper(AllTrim(aDadosFilial[17])))
+	// verifica se é base teste ou produção para alterar endpoints
+    Local lBaseProducao := Upper(AllTrim(GetSrvProfString("dbalias", ""))) == "SIGAPROD"
+
+    oProcess := TWFProcess():New("WFFastCC","Workflow Envio de link para pagamento via CC")
+	oProcess:NewTask('Criando envio de link CC',"\workflow\fastconnect\WFFastLinkPgtoCC.html")
+	oHtml    := oProcess:oHtml
+
+    // logo da empresa
+    oHtml:ValByName("cLogo", AllTrim(cLogoEmpresa))
+
+    // nome do cliente
+    oHtml:ValByName("cNomeCliente", AllTrim(cNomeCli))
+    // nome fantasia do cliente
+    oHtml:ValByName("cNomeFant", AllTrim(cNomeFantasia))
+    // valor da parcela
+    oHtml:ValByName("cValor", "R$ " + Transform(nVlrVenda, PesqPict("SE1", "E1_SALDO")))
+    // numero total de parcelas
+    oHtml:ValByName("cTotParcelas", cValToChar(nTotParcelas))
+    // link de pagamento
+    oHtml:ValByName("cLinkPgto", AllTrim(cLinkPgto))
+    // telefone de contato
+    oHtml:ValByName("cTelContato", AllTrim(cTelefoneContato))
+    // e-mail de contato
+    oHtml:ValByName("cEmailContato", AllTrim(cEmailContato))
+    
+
+    // logo da fast
+    oHtml:ValByName("cLogoFast", AllTrim(cLogoFast))
+    
+    // dados do envio
+	If lBaseProducao
+    	oProcess:cTo    	:= cEmailCli
+    	oProcess:cCC    	:= cEmailCliCC
+    	oProcess:cSubject  	:= "Venda recorrente"
+	Else
+    	oProcess:cTo    	:= UsrRetMail(RetCodUsr())
+    	oProcess:cCC    	:= ""
+    	oProcess:cSubject  	:= "Venda recorrente - Gerado em base teste (não enviado ao cliente)"
+	EndIf
+    oProcess:cBody    	:= ""
+	// oProcess:cBCC		:= "daniel.scheeren@gruppe.com.br"
+
+    oProcess:Start()
+    WFSendMail()
+    oProcess:Finish()
+
+Return .T.
+
+// MailCliCC("daniel.scheeren@gruppe.com.br", "daniel.scheeren@gruppe.com.br", "DANIEL", "D2", 1, 1, 20, 'HTTP:\\LOCALHOST\TESTE')
+

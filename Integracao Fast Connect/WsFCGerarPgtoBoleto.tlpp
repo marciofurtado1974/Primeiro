@@ -1,0 +1,365 @@
+#include "Tlpp-Core.th"
+#include "Tlpp-Rest.th"
+#include "Protheus.ch"
+
+#Define WS_ENDPOINT 		"/boleto"
+
+// porta base teste
+// #Define URL_RETORNO_FC 		SuperGetMV("MV_WSRETBO", .F., "http://erp.grupokhronos.com.br:9093/rest/pagamento/boleto")
+// porta base produção
+// #Define URL_RETORNO_FC 		SuperGetMV("MV_WSRETBO", .F., "http://erp.grupokhronos.com.br:9090/rest/pagamento/boleto")
+
+/*/{Protheus.doc} WsFCGerarPgtoBoleto
+    Integração de títulos de boleto com a FastConnect
+    @type function
+    @version 1.0
+    @author Daniel Scheeren - Gruppe
+    @since 03/09/2021
+    /*/
+User Function WsFCGerarPgtoBoleto()
+
+	Local aHeader		:= {}				as array
+	Local _lRetOk		:= .T. 				as logical
+	Local oRest								as object
+	Local _cAliasTmp	:= GetNextAlias() 	as character
+	Local jJson								as json
+	Local jJsonRet							as json
+	Local cDataVncto	:= ""				as character
+	Local aDadosLog		:= {"","","","",""}	as array
+	Local _nQtdBoletos	:= 0				as numeric
+	Local cJson 		:= ""				as character
+	Local cChave		:= ""				as character
+	Local cInfComplem   := ""				as character
+	Local nPDescVcto 	:= 0				as numeric
+	Local nValDescVcto 	:= 0				as numeric
+	// indica quantidade de dias a considerar para integrar antes do vencimento e não pela emissão (se zero envia pela emissão)
+	Local nDiasAntesVcto := SuperGetMV("FC_DINTAVC", .F., 0)
+	// Local oMsgWhatsApp  := PCWhastApp():New()
+	Local aJsonPost		:= {}
+	// verifica se é base teste ou produção para alterar endpoints
+    Local lBaseProducao := Upper(AllTrim(GetSrvProfString("dbalias", ""))) == "SIGAPROD"
+
+	If lBaseProducao
+		// url de retorno base produção
+		cURLRetorno		:= SuperGetMV("FC_WSRETBO", .F., "http://erp.grupokhronos.com.br:9090/rest/pagamento/boleto")
+	Else
+		// url de retorno base teste
+		cURLRetorno		:= "http://erp.grupokhronos.com.br:9093/rest/pagamento/boleto"
+	EndIf
+
+	// fecha tabela se aberta
+	If Select(_cAliasTmp) > 0
+		(_cAliasTmp)->(DbCloseArea())
+	EndIf
+
+	// busca títulos de boletos a receber
+	_cQuery := " SELECT E1_NUM "
+	_cQuery += " 		,E1_PREFIXO "
+	_cQuery += " 		,E1_CLIENTE "
+	_cQuery += " 		,E1_LOJA "
+	_cQuery += " 		,E1_TIPO "
+	_cQuery += " 		,E1_PARCELA "
+	// se a natureza do título retem ISS, subtrai no valor do boleto
+	// CEN
+	If cEmpAnt == "04"
+		_cQuery += " 		,(CASE WHEN ED_CALCISS = 'S' THEN (SE1.E1_SALDO + SE1.E1_ACRESC - SE1.E1_DECRESC - SE1.E1_ISS) ELSE (SE1.E1_SALDO + SE1.E1_ACRESC - SE1.E1_DECRESC) END) AS TOTAL "
+	Else
+		_cQuery += " 		,SE1.E1_SALDO + SE1.E1_ACRESC - SE1.E1_DECRESC - (SE1.E1_ISS + SE1.E1_CSLL + SE1.E1_COFINS + SE1.E1_INSS + SE1.E1_PIS + SE1.E1_IRRF) AS TOTAL "
+	EndIf
+	// _cQuery += " 		,E1_DECRESC AS DESCONTO"
+	_cQuery += " 		,E1_VENCREA AS VENCTO "
+	_cQuery += " 		,E1_CONTKHR AS CONTRATO "
+	_cQuery += " 		,E1_ORIGEM "
+	_cQuery += " 		,E1_NFELETR "
+	_cQuery += " 		,E1_SERIE "
+	_cQuery += " 		,A1_NOME "
+	_cQuery += " 		,A1_CGC "
+	_cQuery += " 		,REPLACE(TRIM(A1_EMAIL), ',', ';') as A1_EMAIL "
+	_cQuery += " 		,A1_DDD "
+	_cQuery += " 		,A1_TEL "
+	_cQuery += " 		,A1_CEP "
+	_cQuery += " 		,A1_END "
+	_cQuery += " 		,A1_BAIRRO "
+	_cQuery += " 		,A1_COMPLE "
+	_cQuery += " 		,A1_MUN "
+	_cQuery += " 		,A1_EST "
+	// _cQuery += " 		,COUNT(E1_PARCELA) AS PARCELAS "
+	_cQuery += " FROM " + RetSQLTab("SE1") + ", " + RetSQLTab("SED") + ", " + RetSQLTab("SA1")
+	_cQuery += " WHERE " + RetSQLCond("SE1")
+	_cQuery += " AND " + RetSQLCond("SA1")
+	_cQuery += " AND " + RetSQLCond("SED")
+
+	// envia x dias antes do vencimento
+	If nDiasAntesVcto > 0
+		_cQuery += " AND TO_CHAR(TO_DATE(E1_VENCREA, 'YYYYMMDD') - " + cValToChar(nDiasAntesVcto) + ", 'YYYYMMDD') <= '" + DToS(Date()) + "' "
+
+	// filtra somente emissão até a data de hoje
+	Else
+		_cQuery += " AND E1_EMISSAO <= '" + DToS(Date()) + "' "
+	EndIf
+	// títulos que não são cartão de crédito
+	_cQuery += " AND TRIM(E1_TIPO) <> 'CC' "
+	// somente pendentes ou reenvio
+	_cQuery += " AND E1_ZSTATFC = 'P' "
+	// título não baixado
+	_cQuery += " AND E1_SALDO   > 0 "
+
+	// ***** AS REGRAS ABAIXO SE ALTERADAS DEVEM SER REPLICADAS TAMBÉM PARA A INTEGRAÇÃO DA EXCELÊNCIA (WsEXEnviarTitulosVencidos e WsEXCancelarCobrancaTitulos) *****
+	// verifica se a orgiem for NF e se já possui o número da NF (pois é realizado consulta de NFSe que grava no campo E1_NFELETR)
+	// ou se não possuir o campo preenchido verifica se existe a nota no SF2 e se está autorizada
+	If lBaseProducao	// somente base de produção
+		_cQuery += " AND (CASE WHEN TRIM(E1_ORIGEM) = 'MATA460' AND (TRIM(E1_NFELETR) <> ' ' OR TRIM((SELECT F2_DOC FROM " + RetSQLTab("SF2") + " WHERE " + RetSQLCond("SF2") + " AND F2_DOC = E1_NUM AND F2_SERIE = E1_SERIE AND F2_CLIENTE = E1_CLIENTE AND F2_LOJA = E1_LOJA AND TRIM(F2_FIMP) = 'S')) <> ' ')
+		_cQuery += " 		THEN 1 
+		// ou demais títulos que não são de origem de NF
+		_cQuery += " 		ELSE (CASE WHEN TRIM(E1_ORIGEM) <> 'MATA460'
+		_cQuery += " 				THEN 1 
+		_cQuery += " 				ELSE 0 
+		_cQuery += " 			END) 
+		_cQuery += " 		END) = 1 "
+	EndIf
+	// verifica se título veio de contrato e verifica o tipo de pagamento pelo contrato
+	_cQuery += " AND (CASE WHEN TRIM(E1_TIPO) = 'NF' AND TRIM(E1_CONTKHR) <> ' '
+	_cQuery += " 		THEN 
+	// busca o contrato e verifica a forma de pagamento se é difernte de CC
+	_cQuery += " 			(CASE WHEN (SELECT TRIM(ZC_FORMA) FROM " + RetSQLTab("SZC") + " WHERE " + RetSQLCond("SZC") + " AND ZC_NUM = E1_CONTKHR) <> 'CC' THEN 1 ELSE 0 END)
+	// verifica se for título de NF e não possui contrato também envia (NF normal)
+	_cQuery += " 		WHEN TRIM(E1_TIPO) = 'NF' AND TRIM(E1_CONTKHR) IS NULL
+    _cQuery += "			THEN 1
+	// ou se título não for de NF
+	_cQuery += " 		ELSE (CASE WHEN TRIM(E1_ORIGEM) <> 'MATA460' 
+	_cQuery += " 				THEN 1 
+	_cQuery += " 				ELSE 0 
+	_cQuery += " 			END) 
+	_cQuery += " 		END) = 1 "
+	_cQuery += " AND A1_COD     = E1_CLIENTE "
+	_cQuery += " AND A1_LOJA    = E1_LOJA "
+	_cQuery += " AND E1_NATUREZ = ED_CODIGO "
+
+	_cQuery := ChangeQuery(_cQuery)
+	DbUseArea(.T., 'TOPCONN', TCGENQRY(,,_cQuery), (_cAliasTmp), .F., .T.)
+	(_cAliasTmp)->(DbGoTop())
+	// quantidade de envios
+	Count To _nQtdBoletos
+	(_cAliasTmp)->(DbGoTop())
+	
+	If _nQtdBoletos > 0
+
+		// grava log
+		U_FCLog("BOL", aDadosLog, "Iniciado processo de envio de boletos.")
+
+		// grava log
+		U_FCLog("BOL", aDadosLog, "Quantidade de boletos a serem enviados: " + cValToChar(_nQtdBoletos))
+
+		// cabeçalho de requisição
+		aAdd(aHeader, "Content-Type: application/json")
+		aAdd(aHeader, "Client-Code: " + CLIENT_CODE)
+		aAdd(aHeader, "Client-key: " + TOKEN)
+
+		While ! (_cAliasTmp)->(Eof())
+
+			// dados do título para gravação do log
+			aDadosLog := {;
+				(_cAliasTmp)->E1_NUM,;
+				(_cAliasTmp)->E1_PREFIXO,;
+				(_cAliasTmp)->E1_PARCELA,;
+				(_cAliasTmp)->E1_CLIENTE,;
+				(_cAliasTmp)->E1_LOJA,;
+				(_cAliasTmp)->E1_TIPO;
+			}
+
+			// zera variável
+			cInfComplem := ""
+			aJsonPost   := {}
+			
+			// formata data de vencimento
+			cDataVncto   := SubStr((_cAliasTmp)->VENCTO, 1, 4) + "-" + SubStr((_cAliasTmp)->VENCTO, 5, 2) + "-" + SubStr((_cAliasTmp)->VENCTO, 7, 2)
+			cDataEmissao := DToS(Date())
+			cDataEmissao := SubStr(cDataEmissao, 1, 4) + "-" + SubStr(cDataEmissao, 5, 2) + "-" + SubStr(cDataEmissao, 7, 2)
+
+			// chave de referencia
+			cChave := AllTrim(cEmpAnt + cFilAnt + (_cAliasTmp)->E1_NUM + (_cAliasTmp)->E1_PREFIXO + (_cAliasTmp)->E1_PARCELA + (_cAliasTmp)->E1_CLIENTE + (_cAliasTmp)->E1_LOJA + (_cAliasTmp)->E1_TIPO)
+
+			// verifica se possui mais de um e-mail para enviar somente o primeiro (chave da Fast)
+			nMultEmail := At(";", AllTrim((_cAliasTmp)->A1_EMAIL)) -1
+			// separa os demais e-mail para enviar como cópia
+			cEmailCC := If(nMultEmail > 0, AllTrim(SubStr((_cAliasTmp)->A1_EMAIL, At(";", AllTrim((_cAliasTmp)->A1_EMAIL))+1)), "")
+
+			// formatação do DDD e telefone, remove traços e espaços entre números
+			cDDD         := StrTran(StrTran(StrTran(StrTran(StrTran(AllTrim((_cAliasTmp)->A1_DDD), "-", ""), " ", ""), ".", ""), "(", ""), ")", "")
+			nLenDDD      := Len(cDDD)
+			cDDDFormatado := If(nLenDDD == 3, SubStr(cDDD, 2, 2), cDDD)
+
+			cTelefone    := StrTran(StrTran(StrTran(StrTran(StrTran(AllTrim((_cAliasTmp)->A1_TEL), "-", ""), " ", ""), ".", ""), "(", ""), ")", "")
+			nLenTelefone := Len(cTelefone)
+			// tratativa se tiver sido informado DDD no campo telefone
+			If ( (nLenTelefone == 10 .or. nLenTelefone == 11) .and. SubStr(cTelefone, 1, 2) == cDDDFormatado )	// Ex: 47123456789
+				cTelefoneFormatado := SubStr(cTelefone, 3)
+			ElseIf ( nLenTelefone == 12 .and. SubStr(cTelefone, 1, 3) == ("0" + cDDDFormatado) )	// Ex: 047123456789
+				cTelefoneFormatado := SubStr(cTelefone, 4)
+			Else
+				cTelefoneFormatado := cTelefone
+			EndIf
+			
+			// JSON
+			cJson := ' {
+			cJson += ' 	"url_retorno": "' + cURLRetorno + '", '
+			cJson += ' 	"nm_cliente": "' + EncodeUtf8(SubStr(AllTrim((_cAliasTmp)->A1_NOME), 1, 40)) + '",
+			cJson += ' 	"nu_documento": "' + AllTrim((_cAliasTmp)->A1_CGC) + '",
+			If nMultEmail > 0
+				cJson += ' 	"ds_email": "' + EncodeUtf8(SubStr(AllTrim((_cAliasTmp)->A1_EMAIL), 1, nMultEmail)) + '",
+				// cópia de e-mail
+				If !Empty(cEmailCC) .and. !(cEmailCC == ";")
+					cJson += ' 	"email_cc": "' + EncodeUtf8(cEmailCC) + '",
+				EndIf
+			Else
+				cJson += ' 	"ds_email": "' + EncodeUtf8(AllTrim((_cAliasTmp)->A1_EMAIL)) + '",
+			EndIf
+			// remove traços e espaços entre números
+			cJson += ' 	"nu_telefone": "' + cDDDFormatado + cTelefoneFormatado + '",
+			cJson += ' 	"vl_total": ' + cValToChar((_cAliasTmp)->TOTAL) + ',
+			// adiciona desconto
+			// If (_cAliasTmp)->DESCONTO > 0
+			// 	cJson += ' 	"vl_desconto": ' + cValToChar((_cAliasTmp)->DESCONTO) + ',
+			// 	cJson += ' 	"dt_desconto": "' + cDataEmissao + '",
+			// EndIf
+			cJson += ' 	"dt_vencimento": "' + cDataVncto + '",
+			cJson += ' 	"nu_referencia": "' + cChave + '",
+			// cJson += ' 	"nu_parcelas": ' + cValToChar((_cAliasTmp)->PARCELAS) + ',
+			// sempre uma parcela (se informado mais, realiza o parcelamento da própria parcela)
+			cJson += ' 	"nu_parcelas": 0,
+			// AV = (A Vista), PL = (Parcelado pela loja), AS = (Assinatura)
+			// cJson += ' 	"tipo_venda": "' + If((_cAliasTmp)->PARCELAS > 1, "PL", "AV") + '",
+			cJson += ' 	"tipo_venda": "AV",
+			// cJson += ' 	"dia_cobranca": null,
+			cJson += ' 	"ds_cep": "' + AllTrim((_cAliasTmp)->A1_CEP) + '",
+			cJson += ' 	"ds_endereco": "' + EncodeUtf8(AllTrim((_cAliasTmp)->A1_END)) + '",
+			cJson += ' 	"ds_bairro": "' + EncodeUtf8(AllTrim((_cAliasTmp)->A1_BAIRRO)) + '",
+			cJson += ' 	"ds_complemento": "' + EncodeUtf8(AllTrim((_cAliasTmp)->A1_COMPLE)) + '",
+			cJson += ' 	"ds_numero": 1,
+			cJson += ' 	"nm_cidade": "' + EncodeUtf8(AllTrim((_cAliasTmp)->A1_MUN)) + '",
+			cJson += ' 	"nm_estado": "' + EncodeUtf8(AllTrim((_cAliasTmp)->A1_EST)) + '",
+			cJson += ' 	"vl_juros": ' + cValToChar(SuperGetMV("MV_FCJUROS", .F., 0)) + ',
+			cJson += ' 	"vl_multa": ' + cValToChar(SuperGetMV("MV_FCMULTA", .F., 0)) + ',
+			// cJson += ' 	"tp_boleto_multa": "V",
+			// cJson += ' 	"ds_info": null,
+			// cJson += ' 	"ds_instrucao": null,
+			// cJson += ' 	"tp_carne": "N"
+
+			// nota fiscal
+			If AllTrim((_cAliasTmp)->E1_ORIGEM) == "MATA460" .or. !Empty((_cAliasTmp)->E1_NFELETR)
+				cInfComplem += "Nota Fiscal: " + If(!Empty((_cAliasTmp)->E1_NFELETR), AllTrim((_cAliasTmp)->E1_NFELETR), AllTrim((_cAliasTmp)->E1_NUM)) + "/" + AllTrim((_cAliasTmp)->E1_SERIE) + "; "
+			Else
+				cInfComplem += "Título: " + AllTrim((_cAliasTmp)->E1_NUM) + "/" + AllTrim((_cAliasTmp)->E1_PREFIXO) + "; "
+			EndIf
+			// contrato
+			If !Empty((_cAliasTmp)->CONTRATO)
+				cInfComplem += "Contrato: " + AllTrim((_cAliasTmp)->CONTRATO) + "; "
+			EndIf
+			// parcela
+			cInfComplem += "Parcela: " + AllTrim((_cAliasTmp)->E1_PARCELA) + "; "
+
+			// Instrução que irá ser inserido no boleto (informação)
+			If !Empty(cInfComplem)
+				cJson += ' 	"ds_instrucao": "' + EncodeUtf8(cInfComplem) + '", '
+			EndIf
+
+			aDadosFilial := FWArrFilAtu(cEmpAnt, cFilAnt)
+			
+			// cJson += ' 	"nm_beneficiario": "' + EncodeUtf8(Upper(AllTrim(FWFilName(cEmpAnt, cFilAnt)))) + '", '
+			cJson += ' 	"nm_beneficiario": "' + EncodeUtf8(Upper(AllTrim(aDadosFilial[17]))) + '", '	// M0_NOMECOM
+			cJson += ' 	"nu_documento_beneficiario": "' + EncodeUtf8(AllTrim(cValToChar(aDadosFilial[18]))) + '", '	// M0_CGC
+
+			// informa que o boleto será gerado no momento do envio
+			// cJson += ' 	"gerar": true, '
+    		cJson += ' 	"tp_gerar": true '
+			cJson += ' } '
+
+			// remove caracteres especiais
+			cJson := FwCutOff(cJson, .F.)
+
+			// endereço da integração
+			oRest := FWRest():New(HOST)
+
+			// path
+			oRest:SetPath(WS_ENDPOINT)
+
+			// json com os dados de envio
+			oRest:SetPostParams("body")
+			oRest:SetPostParams(cJson)
+			oRest:SetChkStatus(.T.)
+
+			// tenta efetuar o Post
+			If oRest:Post(aHeader)
+
+				jJson    := JsonObject():New()
+				jJsonRet := JsonObject():New()
+
+				// Resgata a resposta do JSON
+				jJson:FromJson(DecodeUTF8(oRest:GetResult()))
+
+				// recebe o retorno
+				_lRetOk  := jJson['success']
+
+				// dados de retorno
+				jJsonRet:FromJson(AllTrim(jJson['data']:ToJson()))
+
+				// tabela de integração de título x fastconnect
+				U_FCGravaDadosRetorno("boleto", aDadosLog, jJsonRet, _lRetOk, Nil, Nil, "R")
+				
+				// grava log
+				U_FCLog("BOL", aDadosLog, "Sucesso no envio do boleto.", "R", cJson, jJsonRet, "")
+
+				// linha digitável
+				If jJsonRet:HasProperty("linha_digitavel") .and. !Empty(jJsonRet["linha_digitavel"])
+					AAdd(aJsonPost, AllTrim(DecodeUTF8(jJsonRet["linha_digitavel"])))
+				EndIf
+				// link do pdf
+				If jJsonRet:HasProperty("link_pdf") .and. !Empty(jJsonRet["link_pdf"])
+					AAdd(aJsonPost, AllTrim(DecodeUTF8(jJsonRet["link_pdf"])))
+				EndIf
+
+				If Len(aJsonPost) == 2
+					// envia mensagem para o whatsapp do cliente
+					// oMsgWhatsApp:EnviaFatura(aDadosLog, cDDDFormatado + cTelefoneFormatado, aJsonPost)
+				Else
+					// grava log
+					U_FCLog("WHP", aDadosLog, "Não foi possível enviar a mensagem via WhatsApp, pois não foram gerados link de PDF e linha digitável.", "E", "", Nil, "")
+				EndIf
+			Else
+				jJsonRet := JsonObject():New()
+				_lRetOk  := .F.
+
+				// Resgata a resposta do JSON
+				jJsonRet:FromJson(AllTrim(oRest:GetResult()))
+
+				// código de erro
+				cErro := DecodeUTF8(AllTrim(oRest:GetLastError()))
+
+				// extrai mensagens do json de retorno
+				cErro += U_FCFormataErrosRetorno(jJsonRet)
+
+				// tabela de integração de título x fastconnect
+				U_FCGravaDadosRetorno("boleto", aDadosLog, jJsonRet, _lRetOk, .T., Nil, "E")
+
+				// grava log
+				U_FCLog("BOL", aDadosLog, "Erro no envio do boleto.", "E", cJson, jJsonRet, cErro)
+
+				// envia e-mail do erro
+				U_FCEnvioDeEMail(aDadosLog, "BOL")
+			EndIf
+
+			(_cAliasTmp)->(DbSkip())
+		End
+	
+		// grava log
+		U_FCLog("BOL", {"","","","",""}, "Finalizado processo de envio de boletos.")
+
+	EndIf
+
+	// fecha tabela
+	If Select(_cAliasTmp) > 0
+		(_cAliasTmp)->(DbCloseArea())
+	EndIf
+
+Return Nil
+

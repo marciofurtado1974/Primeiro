@@ -1,0 +1,1283 @@
+#include "tlpp-core.th"
+#include "tlpp-rest.th"
+#include 'tbiconn.ch'
+
+// base teste
+// #Define HOST                    "https://api-sandbox.fpay.me"
+// #Define TOKEN_FC                "6ea297bc5e294666f6738e1d48fa63d2"
+// #Define CLIENT_CODE_FC          "FC-SB-15"
+
+// base produção
+// #Define HOST			        "https://api.fpay.me"
+#Define WS_ENDPOINT_ID_BOLETO	"/boleto/"
+#Define WS_ENDPOINT_ID_CREDITO	"/credito/"
+// fixado, pois precisa do ambiente aberto para acessar parâmetros
+#Define TOKEN_FC_CEN 			"292f548d-9bc1-462b-80f4-0c6efd3c7aa1" //SuperGetMV("MV_TOKENFC", .F., "")
+#Define CLIENT_CODE_FC_CEN 		"FC-124699"   //SuperGetMV("MV_CLICOFC", .F., "")
+
+#Define TOKEN_FC_KME 			"210ab99a0b47d0da0dcb5d066bb99f8f" //SuperGetMV("MV_TOKENFC", .F., "")
+#Define CLIENT_CODE_FC_KME 		"FC-325241"   //SuperGetMV("MV_CLICOFC", .F., "")
+
+#Define TOKEN_FC_KSP 			"d341ab62c7e77feee9a603c80869b678" //SuperGetMV("MV_TOKENFC", .F., "")
+#Define CLIENT_CODE_FC_KSP 		"FC-553525"   //SuperGetMV("MV_CLICOFC", .F., "")
+
+#Define TOKEN_FC_SANDBOX		"6ea297bc5e294666f6738e1d48fa63d2"
+#Define CLIENT_CODE_FC_SANDBOX	"FC-SB-15" 
+
+/*/{Protheus.doc} FastConnect
+    Classe rest de retorno de pagamentos Fasct Connect
+    @type class
+    @version 1.0
+    @author Daniel Scheeren - Gruppe
+    @since 21/10/2021
+    /*/
+Class FastConnect
+
+    // Construtor
+    public Method New() CONSTRUCTOR
+
+    // Recebe a notificação de pagamento de Boleto
+    @Post("pagamento/boleto")
+    public Method PostPagamentoBoleto()
+
+    // Recebe a notificação de pagamento de Cartão de Crédito
+    @Post("pagamento/credito")
+    public Method PostPagamentoCC()
+    
+    // Recebe a notificação de status de captura de Cartão de crédito
+    @Post("notifica/captura")
+    public Method PostRecebimentoCapturaCartao()
+    
+EndClass
+
+/*/{Protheus.doc} FastConnect::New
+    Contrutor da classe
+    @type method
+    @version 1.0
+    @author Daniel Scheeren - Gruppe
+    @since 21/10/2021
+    @return variant, return_description
+    /*/
+Method New() Class FastConnect
+Return
+
+/*/{Protheus.doc} FastConnect::PostPagamentoBoleto
+    Recebe notificação de pagamento de boleto
+    @type method
+    @version 1.0
+    @author Daniel Scheeren - Gruppe
+    @since 21/10/2021
+    @return variant, return_description
+    /*/
+Method PostPagamentoBoleto() Class FastConnect
+
+    // retorno do processo
+    Local lRet      := .T.
+    // código de erro
+    Local cCodErro  := 200  // OK
+    // dados do título para log
+    Local aDadosLog := {"","","","","",""}
+    // dados de cabeçalho e token de integração
+    Local aHeaderSandBox := {}
+    Local aHeaderCEN	 := {}
+    Local aHeaderKME	 := {}
+    Local aHeaderKSP	 := {}
+    // Local _cQuery   := ""
+    Local cChave     := ""
+    Local cChaveLog  := ""
+    Local _cEmpresa  := ""
+    Local _cFilial   := ""
+    Local cTipIntegracao := "BOL"
+    Local dDataBaixa := SToD("")
+    Local nValMulta  := 0
+    Local nValJuros  := 0
+    // body json
+    Local jBody      := JsonObject():new()
+    // body retorno
+    Local jResponse  := JsonObject():new()
+    Local oRestVenda
+    Local nTamEmp    := If(!Empty(cEmpAnt), Len(cEmpAnt), 2)
+    Local nTamFil    := If(!Empty(cFilAnt), Len(cFilAnt), 2)
+    // verifica se é base teste ou produção para alterar endpoints
+    Local lBaseProducao := Upper(AllTrim(GetSrvProfString("dbalias", ""))) == "SIGAPROD"
+    Local cHost := ""
+
+	If lBaseProducao
+		// url de consulta base produção
+        cHost := "https://api.fpay.me"
+    
+        // cabeçalho de requisição
+        aAdd(aHeaderCEN, "Content-Type: application/json")
+        aAdd(aHeaderCEN, "Client-Code: " + CLIENT_CODE_FC_CEN)
+        aAdd(aHeaderCEN, "Client-key: " + TOKEN_FC_CEN)
+
+        aAdd(aHeaderKME, "Content-Type: application/json")
+        aAdd(aHeaderKME, "Client-Code: " + CLIENT_CODE_FC_KME)
+        aAdd(aHeaderKME, "Client-key: " + TOKEN_FC_KME)
+
+        aAdd(aHeaderKSP, "Content-Type: application/json")
+        aAdd(aHeaderKSP, "Client-Code: " + CLIENT_CODE_FC_KSP)
+        aAdd(aHeaderKSP, "Client-key: " + TOKEN_FC_KSP)
+
+	Else
+		// url de consulta base teste
+		cHost := "https://api-sandbox.fpay.me"
+    
+        aAdd(aHeaderSandBox, "Content-Type: application/json")
+        aAdd(aHeaderSandBox, "Client-Code: " + CLIENT_CODE_FC_SANDBOX)
+        aAdd(aHeaderSandBox, "Client-key: " + TOKEN_FC_SANDBOX)
+
+	EndIf
+
+    // grava dados do body recebido
+    jBody:FromJson(oRest:GetBodyRequest())
+
+    // validações
+    If ( jBody:ToJson() != "{}" )
+
+        // valida se recebeu o código identificador da venda
+        If jBody:HasProperty("fid")
+
+            // endereço da integração
+        	oRestVenda 	 := FWRest():New(cHost)
+
+            // path consutla credito
+            oRestVenda:SetPath(WS_ENDPOINT_ID_BOLETO + AllTrim(jBody['fid']))
+
+            oRestVenda:SetChkStatus(.T.)
+
+            // verifica se categoria esta informada
+            If jBody:HasProperty("categoria")
+
+                // categoria do retorno
+                cCategoria := jBody["categoria"]
+
+                // nao processa boleto.pendente para não gerar "erro" em que não encontra o boleto, pois após ser recebido demora para "aparecer" na consulta da Fast
+                If cCategoria != "boleto.pendente"
+
+                    // tenta efetuar o Get
+                    If (lBaseProducao .and. (oRestVenda:Get(aHeaderCEN) .or. oRestVenda:Get(aHeaderKME) .or. oRestVenda:Get(aHeaderKSP))) ;   // base de produção
+                        .or. (!lBaseProducao .and. oRestVenda:Get(aHeaderSandBox))  // base de testes
+
+                        jJsonBoleto := JsonObject():New()
+
+                        // resgata a resposta do JSON
+                        jJsonBoleto:FromJson(DecodeUTF8(oRestVenda:GetResult()))
+
+                        jJsonBoleto := jJsonBoleto['data']
+
+                        // chave de referência contendo os dados da empresa e titulo
+                        cChave    := AllTrim(jJsonBoleto['nu_referencia'])
+                        _cEmpresa := SubStr(cChave, 1, nTamEmp)
+                        _cFilial  := SubStr(cChave, nTamEmp+1, nTamFil)
+                        
+                        // atualiza chave, removendo dados da empresa
+                        cChave    := SubStr(cChave, (nTamEmp + nTamFil + 1))
+
+                        // prepara ambiente
+                        RpcClearEnv()
+                        RpcSetType(3)
+                        RpcSetEnv(_cEmpresa, _cFilial,,, "FIN",,,,,,)
+
+                        // tratamento de dados do título
+                        nPos         := 1
+                        // Num Título
+                        aDadosLog[1] := SubStr(cChave, nPos, TamSX3("E1_NUM")[1])
+                        nPos         += Len(aDadosLog[1])
+                        // Prefixo
+                        aDadosLog[2] := SubStr(cChave, nPos, TamSX3("E1_PREFIXO")[1])
+                        nPos         += Len(aDadosLog[2])
+                        // Parcela
+                        aDadosLog[3] := SubStr(cChave, nPos, TamSX3("E1_PARCELA")[1])
+                        nPos         += Len(aDadosLog[3])
+                        // Cliente
+                        aDadosLog[4] := SubStr(cChave, nPos, TamSX3("E1_CLIENTE")[1])
+                        nPos         += Len(aDadosLog[4])
+                        // Loja
+                        aDadosLog[5] := SubStr(cChave, nPos, TamSX3("E1_LOJA")[1])
+                        nPos         += Len(aDadosLog[5])
+                        // Tipo
+                        aDadosLog[6] := SubStr(cChave, nPos, TamSX3("E1_TIPO")[1])
+                        nPos         += Len(aDadosLog[6])
+
+                        
+                        Do Case
+                            // Quando o valor é repassado para o cliente.
+                            Case cCategoria == "recebido"
+
+                                // grava log
+                                U_FCLog(cTipIntegracao, aDadosLog, "Recebido repasse de pagamento do boleto.", Nil, Nil, jBody)
+                                
+                                // busca o título
+                                DbSelectArea("SE1")
+                                SE1->(DbSetOrder(1))	// 1 - E1_FILIAL, E1_PREFIXO, E1_NUM, E1_PARCELA, E1_TIPO
+                                If SE1->(DbSeek(FWxFilial("SE1") + aDadosLog[2] + aDadosLog[1] + aDadosLog[3] + aDadosLog[6]))
+                                    // verifica se o título foi baixado
+                                    If SE1->E1_SALDO > 0
+                                    
+                                        // // tabela de integração de título x fastconnect
+                                        // U_FCGravaDadosRetorno("boleto", aDadosLog, jBody, lRet, Nil, Nil, "B")  // B=Baixado/Pago
+                                        
+                                        // // grava log
+                                        // U_FCLog("BOL", aDadosLog, "Processado retorno de pagamento do boleto.", "B", "", jBody, "")
+
+                                        cStatus   := "P"
+                                        cMensagem := "Recebido repasse e aguardando job de baixa."
+                                    Else
+                                        // grava log
+                                        // U_FCLog("BOL", aDadosLog, "Título não possui mais saldo para ser baixado.", "E", "", jBody, "")
+
+                                        cStatus   := "F"
+                                        cMensagem := "Título já baixado."
+                                    EndIf
+
+                                    // data do pagamento
+                                    dDataBaixa := SToD(SubStr(StrTran(jBody["dt_pagamento"], "-", ""), 1, 8))
+
+                                    // valor pago após vencimento
+                                    If dDataBaixa > SE1->E1_VENCREA
+
+                                        // valor de juros e multa
+                                        If jBody:HasProperty('vl_juros')
+                                            nValJuros     := Val(jBody["vl_juros"])
+                                            nValorReceb   := Val(jBody['vl_recebido'])
+                                            // valor da venda enviada á Fast (total)
+                                            nValorTotFast := Val(jBody['vl_venda'])
+                                            // valor retido pela fast pela taxa cobrada
+                                            nValorTaxa := U_FCCalcVlrTaxa(nValorTotFast, cTipIntegracao)
+
+                                            // verifica se o valor repassado menos o valor de taxa da fast 
+                                            If nValJuros == 0 .and. ((nValorReceb + nValorTaxa) - nValorTotFast) > 0
+                                                // valor de juros + multa
+                                                nVlrSobra := ((nValorReceb + nValorTaxa) - nValorTotFast)
+                                                nValMulta := Round(nValorTotFast * 0.02, 2)   // calcula 2% de multa
+                                                nValJuros := nVlrSobra - nValMulta
+                                            EndIf
+                                        EndIf
+                                        If jBody:HasProperty('vl_multa') .and. nValMulta == 0
+                                            nValMulta := Val(jBody["vl_multa"])
+                                        EndIf
+                                    EndIf
+
+                                Else
+                                    // grava log
+                                    // U_FCLog("BOL", aDadosLog, "Não foi encontrado o título no sistema para realizar baixa.", "E", "", jBody, "")
+
+                                    cStatus   := "F"
+                                    cMensagem := "Não foi encontrado o título no sistema para realizar baixa."
+                                EndIf
+
+                                // verifica se o título já não foi integrado anteriormente
+                                DbSelectArea("Z08")
+                                Z08->(DbSetOrder(1))    // 1- Z08_FILIAL, Z08_TITULO, Z08_PREFIX, Z08_PARCEL, Z08_CLIENT, Z08_LOJA, Z08_TIPTIT
+                                // If Z08->(DbSeek(FWxFilial("Z08") + aDadosLog[1] + aDadosLog[2] + aDadosLog[3] + aDadosLog[4] + aDadosLog[5]))
+                                //     cStatus := "D"  // P=Pendente Baixa;B=Baixado;E=Erro;D=Duplicado
+                                //     cMensagem := "Repasse em duplicidade. Favor verificar."
+                                // EndIf
+
+                                If !Z08->(DbSeek(FWxFilial("Z08") + aDadosLog[1] + aDadosLog[2] + aDadosLog[3] + aDadosLog[4] + aDadosLog[5]))
+                                    RecLock("Z08", .T.)
+                                        Z08->Z08_FILIAL := FWxFIlial("Z08")
+                                        Z08->Z08_TITULO := aDadosLog[1]                     // Numero do título
+                                        Z08->Z08_PREFIX := aDadosLog[2]                     // Prefixo
+                                        Z08->Z08_PARCEL := aDadosLog[3]                     // Parcela
+                                        Z08->Z08_CLIENT := aDadosLog[4]                     // Codigo cliente
+                                        Z08->Z08_LOJA   := aDadosLog[5]                     // Loja
+                                        Z08->Z08_TIPTIT := cTipIntegracao                   // Tipo integraão (BOL, CC)
+                                        Z08->Z08_DATA   := Date()							// Data de gravação da integração
+                                        Z08->Z08_HORA   := Time()							// Hora de gravação da integração
+                                        Z08->Z08_MENSAG := cMensagem                        // Mensagem de status
+                                        Z08->Z08_JSON   := jBody:ToJson()                   // Json recebido
+                                        Z08->Z08_STATUS := cStatus                          // P=Pendente Baixa;B=Baixado;E=Erro Baixa;D=Duplicado;F=Falha no processo
+                                        Z08->Z08_CODREF := AllTrim(jJsonBoleto['nu_referencia'])                 // Referência Fast Connect
+                                        Z08->Z08_DTREPA := SToD(SubStr(StrTran(jBody["dt_recebimento"], "-", ""), 1, 8))
+                                        Z08->Z08_VLREPA := Val(jBody["vl_recebido"])
+                                        Z08->Z08_VLRJUR := nValJuros
+                                        Z08->Z08_VLRMUL := nValMulta
+                                        If jBody:HasProperty("fid")
+                                            Z08->Z08_IDFAST := AllTrim(DecodeUTF8(jBody["fid"]))				// ID da Fast Connect
+                                        EndIf
+                                    Z08->(MsUnlock())
+                                Else
+                                    // envia e-mail de duplicidade
+                                    // EnviaEmail("Json de recebimento em duplicidade de boleto Fast Conenct", "daniel.scheeren@gruppe.com.br", "", jBody:ToJson())
+
+                                    // grava log
+                                    Conout("WSRESTRETORNOFASTCONNECT - Repasse em duplicidade.")
+                                EndIf
+                            
+                            // Quando o valor é pago pelo cliente.
+                            Case cCategoria == "boleto.pago"
+
+                                // grava log
+                                U_FCLog(cTipIntegracao, aDadosLog, "Boleto pago pelo cliente, aguardando repasse para efetuar baixa.", Nil, Nil, jBody)
+                                
+                            // // Quando é criada uma transação com o tipo de pagamento "boleto" mas sem o boleto ser gerado.
+                            // Case cCategoria == "boleto.pendente"
+
+                            //     nPos         := 1
+                            //     // Num Título
+                            //     aDadosLog[1] := SubStr(cChave, nPos, TamSX3("E1_NUM")[1])
+                            //     nPos         += Len(aDadosLog[1])
+                            //     // Prefixo
+                            //     aDadosLog[2] := SubStr(cChave, nPos, TamSX3("E1_PREFIXO")[1])
+                            //     nPos         += Len(aDadosLog[2])
+                            //     // Parcela
+                            //     aDadosLog[3] := SubStr(cChave, nPos, TamSX3("E1_PARCELA")[1])
+                            //     nPos         += Len(aDadosLog[3])
+                            //     // Cliente
+                            //     aDadosLog[4] := SubStr(cChave, nPos, TamSX3("E1_CLIENTE")[1])
+                            //     nPos         += Len(aDadosLog[4])
+                            //     // Loja
+                            //     aDadosLog[5] := SubStr(cChave, nPos, TamSX3("E1_LOJA")[1])
+                            //     nPos         += Len(aDadosLog[5])
+                            //     // Tipo
+                            //     aDadosLog[6] := SubStr(cChave, nPos, TamSX3("E1_TIPO")[1])
+                            //     nPos         += Len(aDadosLog[6])
+                                    
+                            //     // tabela de integração de título x fastconnect
+                            //     U_FCGravaDadosRetorno("boleto", aDadosLog, jBody, lRet, Nil, Nil, "R")
+                                
+                            //     // grava log
+                            //     U_FCLog("BOL", aDadosLog, "Boleto foi recebido pela Fast Connect e se encontra com status " + jBody["situacao"] + ".", "R", "", jBody, "")
+                            
+                            Otherwise
+                            
+                        EndCase
+
+                        // mensagem de retorno sucesso
+                        If jBody:HasProperty("situacao")
+                            // jResponse["message"] := "Sucesso ao receber o retorno. Categoria: '" + cCategoria + "' e situação: '" + Upper(jBody["situacao"]) + "'."
+                            conout(jBody:toJson())
+                            jResponse["message"] := "Sucesso ao receber o retorno." + If(cCategoria != Nil, "Categoria: '" + cCategoria + "'.", "")
+                        Else
+                            jResponse["message"] := "Sucesso ao receber o retorno. Categoria: '" + cCategoria + "'."
+                        EndIf
+
+                    Else
+                        lRet                 := .F.
+                        cCodErro             := 400 // Bad Request
+                        jResponse["message"] := "Não foi possível encontrar a venda."
+                    EndIf
+                
+                // boleto.pendente
+                Else
+                    
+                    // prepara ambiente
+                    RpcClearEnv()
+                    RpcSetType(3)
+                    RpcSetEnv("06", "01",,, "FIN",,,,,,)
+
+                    _cQuery := " SELECT R_E_C_N_O_ "
+                    _cQuery += " FROM " + RetSQLTab("Z04")
+                    _cQuery += " WHERE " + RetSQLCond("Z04")
+                    _cQuery += " AND Z04_IDFAST = '" + AllTrim(jBody["fid"]) + "' "
+
+                    _cQuery := ChangeQuery(_cQuery)
+                    aRecno 	:= U_SQLToVet(_cQuery)
+                    If Len(aRecno) > 0
+                        DbSelectArea("Z04")
+                        Z04->(DbGoTo(aRecno[1,1]))
+                        RecLock("Z04", .F.)
+                            Z04->Z04_LINDGT := AllTrim(DecodeUTF8(jBody["linha_digitavel"]))
+                            Z04->Z04_PDF := AllTrim(DecodeUTF8(jBody["link_pdf"]))
+                        MsUnlock()
+                    EndIf
+                EndIf
+            Else
+                lRet                 := .F.
+                cCodErro             := 400 // Bad Request
+                jResponse["message"] := "Não foi possível identificar a variável 'categoria'."
+                // grava log
+                U_FCLog(cTipIntegracao, aDadosLog, "Erro no recebimento do webhook do boleto.", "E", "", jBody, jResponse["message"])
+            EndIf
+
+
+            If lRet
+                // grava log
+                // U_FCLog("BOL", aDadosLog, "Sucesso no retorno do pagamento do boleto.", "S", "", jBody, "")
+            Else
+                // grava log
+                Conout("WSRESTRETORNOFASTCONNECT - Erro no recebimento do webhook do boleto: " + jResponse["message"])
+            EndIf
+
+            // grava log
+            // U_FCLog("BOL", {"","","","","",""}, "Fim - Recebido retorno de pagamento de boleto.")
+            // busca a chave referencia do título
+            If !Empty(cChave)
+                cChaveLog := cChave
+            ElseIf jBody:HasProperty("nu_referencia")
+                cChaveLog := jBody["nu_referencia"]
+            EndIf
+            Conout("WSRESTRETORNOFASTCONNECT - Recebido status de [" + If(jBody:HasProperty("categoria") .and. jBody["categoria"] != Nil, jBody["categoria"], "sem categoria") + "] ref. chave [" + cChaveLog + "].")
+
+        Else
+            lRet                 := .F.
+            cCodErro             := 400 // Bad Request
+            jResponse["message"] := "Não foi identificado campo FID."
+        EndIf
+    Else
+        lRet                 := .F.
+        cCodErro             := 400 // Bad Request
+        jResponse["message"] := "Não foi possível ler o conteúdo do body."
+    EndIf
+
+    // se ocorreu erro grava no console
+    If !lRet .and. jResponse:HasProperty("message")
+        Conout("WSRESTRETORNOFASTCONNECT - " + jResponse["message"] + " - " + jBody:ToJson() + ".")
+    EndIf
+
+
+    // atualiza status de retorno
+    jResponse["success"] := lRet
+    // status code
+    oRest:SetStatusCode(cCodErro)
+
+    // retorno
+    oRest:SetResponse( jResponse:ToJson() )
+
+    RpcClearEnv()
+    
+Return .T.
+
+
+/*/{Protheus.doc} FastConnect::PostPagamentoCC
+    Recebe notificação de pagamento de cartão de crédito
+    @type method
+    @version 1.0
+    @author Daniel Scheeren - Gruppe
+    @since 29/10/2021
+    @return variant, return_description
+    /*/
+Method PostPagamentoCC() Class FastConnect
+
+    // retorno do processo
+    Local lRet      := .T.
+    // código de erro
+    Local cCodErro  := 200  // OK
+    // dados do título para log
+    Local aDadosLog := {"","","","","",""}
+    // dados de cabeçalho e token de integração
+    Local aHeaderSandBox := {}
+    Local aHeaderCEN	 := {}
+    Local aHeaderKME	 := {}
+    Local aHeaderKSP	 := {}
+    // Local _cQuery   := ""
+    Local cChaveRef    := ""
+    Local cChave    := ""
+    Local cStatus   := ""
+    Local cMensagem := ""
+    Local _cEmpresa := ""
+    Local _cFilial  := ""
+    // body json
+    Local jBody     := JsonObject():new()
+    // body retorno
+    Local jResponse := JsonObject():new()
+    Local oRestVenda
+    Local nTamEmp   := If(!Empty(cEmpAnt), Len(cEmpAnt), 2)
+    Local nTamFil   := If(!Empty(cFilAnt), Len(cFilAnt), 2)
+    // verifica se é base teste ou produção para alterar endpoints
+    Local lBaseProducao := Upper(AllTrim(GetSrvProfString("dbalias", ""))) == "SIGAPROD"
+    Local cHost := ""
+
+	If lBaseProducao
+		// url de consulta base produção
+        cHost := "https://api.fpay.me"
+    
+        // cabeçalho de requisição
+        aAdd(aHeaderCEN, "Content-Type: application/json")
+        aAdd(aHeaderCEN, "Client-Code: " + CLIENT_CODE_FC_CEN)
+        aAdd(aHeaderCEN, "Client-key: " + TOKEN_FC_CEN)
+
+        aAdd(aHeaderKME, "Content-Type: application/json")
+        aAdd(aHeaderKME, "Client-Code: " + CLIENT_CODE_FC_KME)
+        aAdd(aHeaderKME, "Client-key: " + TOKEN_FC_KME)
+        
+        aAdd(aHeaderKSP, "Content-Type: application/json")
+        aAdd(aHeaderKSP, "Client-Code: " + CLIENT_CODE_FC_KSP)
+        aAdd(aHeaderKSP, "Client-key: " + TOKEN_FC_KSP)
+
+	Else
+		// url de consulta base teste
+		cHost := "https://api-sandbox.fpay.me"
+    
+        aAdd(aHeaderSandBox, "Content-Type: application/json")
+        aAdd(aHeaderSandBox, "Client-Code: " + CLIENT_CODE_FC_SANDBOX)
+        aAdd(aHeaderSandBox, "Client-key: " + TOKEN_FC_SANDBOX)
+
+	EndIf
+
+
+    // grava dados do body recebido
+    jBody:FromJson(oRest:GetBodyRequest())
+
+    // validações
+    If ( jBody:ToJson() != "{}" )
+
+        // ----- busca a chave para identificação do título
+        // valida se recebeu o código identificador do título
+        If jBody:HasProperty("nu_referencia")
+
+            // chave de referência contendo os dados da empresa e titulo
+            cChaveRef    := AllTrim(SubStr(jBody["nu_referencia"], 1, At(".", jBody["nu_referencia"])-1))   // remove o ".0" ao final que se trata de um contador da venda via link, pois a Fast permite mais de uma venda por link
+
+        // valida se recebeu o código identificador da venda
+        ElseIf jBody:HasProperty("fid")
+
+            // endereço da integração
+        	oRestVenda 	 := FWRest():New(cHost)
+
+            // path consutla credito
+            oRestVenda:SetPath(WS_ENDPOINT_ID_CREDITO + AllTrim(jBody['fid']))
+
+            oRestVenda:SetChkStatus(.T.)
+
+            // tenta efetuar o Get
+            If (lBaseProducao .and. (oRestVenda:Get(aHeaderCEN) .or. oRestVenda:Get(aHeaderKME) .or. oRestVenda:Get(aHeaderKSP))) ;   // base de produção
+                .or. (!lBaseProducao .and. oRestVenda:Get(aHeaderSandBox))  // base de testes
+
+                jJsonCredito := JsonObject():New()
+
+                // resgata a resposta do JSON
+                jJsonCredito:FromJson(DecodeUTF8(oRestVenda:GetResult()))
+
+                jJsonCredito := jJsonCredito['data']
+
+                // chave de referência contendo os dados da empresa e titulo
+                cChaveRef    := AllTrim(SubStr(jJsonCredito["nu_referencia"], 1, At(".", jJsonCredito["nu_referencia"])-1))   // remove o ".0" ao final que se trata de um contador da venda via link, pois a Fast permite mais de uma venda por link
+                
+            Else
+                lRet                 := .F.
+                cCodErro             := 400 // Bad Request
+                jResponse["message"] := "Não foi possível encontrar a venda. - " + AllTrim(jBody['fid'])
+            EndIf
+
+        Else
+            lRet                 := .F.
+            cCodErro             := 400 // Bad Request
+            jResponse["message"] := "Não foi identificado campo FID ou NU_REFERENCIA para idenficiação do título."
+        EndIf
+
+        
+        // grava os dados de retorno
+        If lRet
+            
+            // dados da empresa
+            _cEmpresa := SubStr(cChaveRef, 1, nTamEmp)
+            _cFilial  := SubStr(cChaveRef, nTamEmp+1, nTamFil)
+            
+            // atualiza chave, removendo dados da empresa
+            cChave    := SubStr(cChaveRef, (nTamEmp + nTamFil + 1))
+
+            // prepara ambiente
+            RpcClearEnv()
+            RpcSetType(3)
+            RpcSetEnv(_cEmpresa, _cFilial,,, "FIN",,,,,,)
+
+            // separa os dados do título
+            nPos         := 1
+            // Num Título
+            aDadosLog[1] := SubStr(cChave, nPos, TamSX3("E1_NUM")[1])
+            nPos         += Len(aDadosLog[1])
+            // Prefixo
+            aDadosLog[2] := SubStr(cChave, nPos, TamSX3("E1_PREFIXO")[1])
+            nPos         += Len(aDadosLog[2])
+            // Parcela
+            aDadosLog[3] := SubStr(cChave, nPos, TamSX3("E1_PARCELA")[1])
+            nPos         += Len(aDadosLog[3])
+            // Cliente
+            aDadosLog[4] := SubStr(cChave, nPos, TamSX3("E1_CLIENTE")[1])
+            nPos         += Len(aDadosLog[4])
+            // Loja
+            aDadosLog[5] := SubStr(cChave, nPos, TamSX3("E1_LOJA")[1])
+            nPos         += Len(aDadosLog[5])
+            // Tipo
+            aDadosLog[6] := SubStr(cChave, nPos, TamSX3("E1_TIPO")[1])
+            nPos         += Len(aDadosLog[6])
+                
+
+            If jBody:HasProperty("categoria")
+
+                // categoria do retorno
+                cCategoria := jBody["categoria"]
+                
+                Do Case
+                    // Quando o valor é repassado para a khronos
+                    Case cCategoria == "recebido"
+
+                        // grava log
+                        U_FCLog("CC", aDadosLog, "Recebido repasse de cobrança de crédito.", Nil, Nil, jBody)
+
+                        // busca o título
+                        DbSelectArea("SE1")
+                        SE1->(DbSetOrder(1))	// 1 - E1_FILIAL, E1_PREFIXO, E1_NUM, E1_PARCELA, E1_TIPO
+                        If SE1->(DbSeek(FWxFilial("SE1") + aDadosLog[2] + aDadosLog[1] + aDadosLog[3] + aDadosLog[6]))
+
+                            While !SE1->(Eof()) .and. AllTrim(SE1->(E1_FILIAL + E1_PREFIXO + E1_NUM + E1_TIPO)) == AllTrim(FWxFilial("SE1") + aDadosLog[2] + aDadosLog[1] + aDadosLog[6])
+                                // verifica se o título foi baixado
+                                If SE1->E1_SALDO > 0 .and. SE1->E1_ZSTATFC != "T"
+                                
+                                    // // tabela de integração de título x fastconnect
+                                    // U_FCGravaDadosRetorno("credito", aDadosLog, jBody, lRet, Nil, Nil, "B")  // B=Baixado/Pago
+                                    
+                                    // // grava log
+                                    // U_FCLog("CC", aDadosLog, "Processado retorno de pagamento da cobrança de crédito.", "B", "", jBody, "")
+
+                                    cStatus   := "P"
+                                    cMensagem := "Recebido repasse e aguardando job de baixa."
+
+                                    // atualiza parcela para realizar a baixa no próximo título com saldo
+                                    aDadosLog[3] := SE1->E1_PARCELA
+
+                                    // sai do loop
+                                    Exit
+                                Else
+                                    // grava log
+                                    // U_FCLog("CC", aDadosLog, "Título não possui mais saldo para ser baixado.", "E", "", jBody, "")
+
+                                    cStatus   := "F"
+                                    cMensagem := "Título já baixado."
+                                EndIf
+
+                                SE1->(DbSkip())
+                            End
+                        Else
+                            // grava log
+                            // U_FCLog("CC", aDadosLog, "Não foi encontrado o título no sistema para realizar baixa.", "E", "", jBody, "")
+                            
+                            cStatus   := "F"
+                            cMensagem := "Não foi encontrado o título no sistema para realizar baixa."
+                        EndIf
+
+                        // verifica se o título já não foi integrado anteriormente
+                        DbSelectArea("Z08")
+                        Z08->(DbSetOrder(1))    // 1- Z08_FILIAL, Z08_TITULO, Z08_PREFIX, Z08_PARCEL, Z08_CLIENT, Z08_LOJA, Z08_TIPTIT
+                        // If Z08->(DbSeek(FWxFilial("Z08") + aDadosLog[1] + aDadosLog[2] + aDadosLog[3] + aDadosLog[4] + aDadosLog[5]))
+                        //     cStatus := "D"  // P=Pendente Baixa;B=Baixado;E=Erro;D=Duplicado
+                        //     cMensagem := "Repasse em duplicidade. Favor verificar."
+                        // EndIf
+
+                        If !Z08->(DbSeek(FWxFilial("Z08") + aDadosLog[1] + aDadosLog[2] + aDadosLog[3] + aDadosLog[4] + aDadosLog[5]))
+                            DbSelectArea("Z08")
+                            RecLock("Z08", .T.)
+                                Z08->Z08_FILIAL := FWxFIlial("Z08")
+                                Z08->Z08_TITULO := aDadosLog[1]                     // Numero do título
+                                Z08->Z08_PREFIX := aDadosLog[2]                     // Prefixo
+                                Z08->Z08_PARCEL := aDadosLog[3]                     // Parcela
+                                Z08->Z08_CLIENT := aDadosLog[4]                     // Codigo cliente
+                                Z08->Z08_LOJA   := aDadosLog[5]                     // Loja
+                                Z08->Z08_TIPTIT := "CC"                             // Tipo integraão (BOL, CC)
+                                Z08->Z08_DATA   := Date()							// Data de gravação da integração
+                                Z08->Z08_HORA   := Time()							// Hora de gravação da integração
+                                Z08->Z08_MENSAG := cMensagem                        // Mensagem de status
+                                Z08->Z08_JSON   := jBody:ToJson()                   // Json recebido
+                                Z08->Z08_STATUS := cStatus                          // P=Pendente Baixa;B=Baixado;E=Erro;D=Duplicado
+                                Z08->Z08_CODREF := AllTrim(cChaveRef)               // Referência Fast Connect
+                                If jBody:HasProperty("fid")
+                                    Z08->Z08_IDFAST := AllTrim(DecodeUTF8(jBody["fid"]))				// ID da Fast Connect
+                                Else
+                                    If jBody:HasProperty("nu_link")  // retorna id do link quando é gerado link de cadastro do cartão
+                                        Z08->Z08_IDFAST := AllTrim(cValToChar(jBody["nu_link"]))		// ID do link da Fast Connect
+                                    EndIf
+                                EndIf
+                                Z08->Z08_DTREPA := SToD(SubStr(StrTran(jBody["dt_recebimento"], "-", ""), 1, 8))
+                                Z08->Z08_VLREPA := Val(jBody["vl_recebido"])
+                                Z08->Z08_VLRJUR := Val(jBody["vl_juros"])
+                                Z08->Z08_VLRMUL := Val(jBody["vl_multa"])
+                            Z08->(MsUnlock())
+                        Else
+                            // envia e-mail de duplicidade
+                            // EnviaEmail("Json de recebimento em duplicidade de cartão Fast Conenct", "daniel.scheeren@gruppe.com.br", "", jBody:ToJson())
+
+                            // grava log
+                            Conout("WSRESTRETORNOFASTCONNECT - Repasse em duplicidade: " + jResponse["message"])
+                        EndIf
+                        
+
+                    // quando a transação é efetuada com sucesso
+                    Case cCategoria == "credito.sucesso" .or. cCategoria == "link.sucesso"
+
+                        // busca o título
+                        DbSelectArea("SE1")
+                        SE1->(DbSetOrder(1))	// 1 - E1_FILIAL, E1_PREFIXO, E1_NUM, E1_PARCELA, E1_TIPO
+                        If SE1->(DbSeek(FWxFilial("SE1") + aDadosLog[2] + aDadosLog[1] + aDadosLog[3] + aDadosLog[6]))
+
+                            While !SE1->(Eof()) .and. SE1->(E1_FILIAL + E1_PREFIXO + E1_NUM + E1_TIPO) == FWxFilial("SE1") + aDadosLog[2] + aDadosLog[1] + aDadosLog[6]
+                                // busca parcela em aberto
+                                If SE1->E1_SALDO > 0 .and. SE1->E1_ZSTATFC != "T"
+                                    
+                                    // atualiza parcela para atualizar o status no  próximo título com saldo
+                                    aDadosLog[3] := SE1->E1_PARCELA
+
+                                    // sai do loop
+                                    Exit
+                                EndIf
+
+                                SE1->(DbSkip())
+                            End
+                            
+                            // tabela de integração de título x fastconnect
+                            U_FCGravaDadosRetorno("credito", aDadosLog, jBody, lRet, Nil, Nil, "T")  // T=Cartão de crédito aprovado
+                            
+                            // grava log
+                            U_FCLog("CC", aDadosLog, "Cartão de crédito aprovado.", "T", "", jBody, "")
+
+                        Else
+                            // grava log
+                            U_FCLog("CC", aDadosLog, "Cartão de crédito aprovado, porém não foi encontrado o título no sistema.", "T", "", jBody, "")
+                        EndIf
+
+                        
+
+                    // quando ocorre algum erro na transação
+                    Case cCategoria == "credito.erro" .or. cCategoria == "link.erro"
+                        
+                        // busca o título
+                        DbSelectArea("SE1")
+                        SE1->(DbSetOrder(1))	// 1 - E1_FILIAL, E1_PREFIXO, E1_NUM, E1_PARCELA, E1_TIPO
+                        If SE1->(DbSeek(FWxFilial("SE1") + aDadosLog[2] + aDadosLog[1] + aDadosLog[3] + aDadosLog[6]))
+                            
+                            While !SE1->(Eof()) .and. SE1->(E1_FILIAL + E1_PREFIXO + E1_NUM + E1_TIPO) == FWxFilial("SE1") + aDadosLog[2] + aDadosLog[1] + aDadosLog[6]
+                                // busca parcela em aberto
+                                If SE1->E1_SALDO > 0 .and. SE1->E1_ZSTATFC != "T"
+                                    
+                                    // atualiza parcela para atualizar o status no próximo título com saldo
+                                    aDadosLog[3] := SE1->E1_PARCELA
+
+                                    // sai do loop
+                                    Exit
+                                EndIf
+
+                                SE1->(DbSkip())
+                            End
+                            
+                            // tabela de integração de título x fastconnect
+                            // U_FCGravaDadosRetorno("credito", aDadosLog, jBody, lRet, Nil, Nil, SE1->E1_ZSTATFC)  // mantém status atual
+                            
+                            // grava log
+                            U_FCLog("CC", aDadosLog, "Cartão de crédito não aprovado.", "E", "", jBody, "")
+
+                        Else
+                            // grava log
+                            U_FCLog("CC", aDadosLog, "Cartão de crédito não aprovado, porém não foi encontrado o título no sistema.", "E", "", jBody, "")
+                        EndIf
+
+                    Otherwise
+                    
+                EndCase
+
+                // mensagem de retorno sucesso
+                If jBody:HasProperty("situacao")
+                    // jResponse["message"] := "Sucesso ao receber o retorno. Categoria: '" + cCategoria + "' e situação: '" + Upper(jBody["situacao"]) + "'."
+                    conout(jBody:ToJson())
+                    jResponse["message"] := "Sucesso ao receber o retorno." + If(cCategoria != Nil, "Categoria: '" + cCategoria + "'.", "")
+                Else
+                    jResponse["message"] := "Sucesso ao receber o retorno. Categoria: '" + cCategoria + "'."
+                EndIf
+
+            Else
+                lRet                 := .F.
+                cCodErro             := 400 // Bad Request
+                jResponse["message"] := "Não foi possível identificar a variável 'categoria'."
+                // grava log
+                U_FCLog("CC", aDadosLog, "Erro no recebimento do webhook de crédito.", "E", "", jBody, jResponse["message"])
+            EndIf
+        EndIf
+
+        // grava retorno
+        If lRet
+            // grava log
+            // U_FCLog("CC", aDadosLog, "Sucesso no retorno da cobrança de crédito.", "S", "", jBody, "")
+        Else
+            // grava log
+            // U_FCLog("CC", aDadosLog, "Erro no recebimento do pagamento via crédito.", "E", "", jBody, jResponse["message"])
+            Conout("WSRESTRETORNOFASTCONNECT - Erro no recebimento do webhook de crédito: " + jResponse["message"])
+        EndIf
+
+        // grava log
+        // U_FCLog("CC", {"","","","","",""}, "Fim - Recebido retorno do pagamento via crédito.")
+        Conout("WSRESTRETORNOFASTCONNECT - Recebido retorno do webhook de crédito.")
+        
+
+    Else
+        lRet                 := .F.
+        cCodErro             := 400 // Bad Request
+        jResponse["message"] := "Não foi possível ler o conteúdo do body."
+    EndIf
+    
+    // se ocorreu erro grava no console
+    If !lRet .and. jResponse:HasProperty("message")
+        Conout("WSRESTRETORNOFASTCONNECT - " + jResponse["message"] + " - " + jBody:ToJson() + ".")
+    EndIf
+
+
+    // atualiza status de retorno
+    jResponse["success"] := lRet
+    // status code
+    oRest:SetStatusCode(cCodErro)
+
+    // retorno
+    oRest:SetResponse( jResponse:ToJson() )
+
+    // TODO acompanhamento inicial via email
+    // prepara ambiente
+    RpcClearEnv()
+    RpcSetType(3)
+    RpcSetEnv("04", "01",,, "FIN",,,,,,)
+
+    EnviaEmail("Json recebimento de cartão Fast Conenct", "daniel.scheeren@gruppe.com.br", "", jBody:ToJson())
+
+
+    RpcClearEnv()
+    
+Return .T.
+
+
+
+/*/{Protheus.doc} FastConnect::RecebimentoCapturaCartao
+    Endpoint para recebimento de captura de cartão
+        Notificação de sucesso ou falha de cartão do cliente
+    @type method
+    @version 1.0
+    @author Daniel Scheeren - Gruppe
+    @since 3/6/2023
+    @return variant, return_description
+    /*/
+Method PostRecebimentoCapturaCartao() Class FastConnect
+
+    // retorno do processo
+    Local lRet      := .T.
+    // código de erro
+    Local cCodErro  := 200  // OK
+    // dados do título para log
+    Local aDadosLog := {"","","","","","",""}
+    // dados de cabeçalho e token de integração
+    Local aHeaderSandBox := {}
+    Local aHeaderCEN	 := {}
+    Local aHeaderKME	 := {}
+    Local aHeaderKSP	 := {}
+    // Local _cQuery   := ""
+    Local cChaveRef    := ""
+    Local cChave    := ""
+    Local cStatus   := ""
+    Local cMensagem := ""
+    Local _cEmpresa := ""
+    Local _cFilial  := ""
+    // body json
+    Local jBody     := JsonObject():new()
+    // body retorno
+    Local jResponse := JsonObject():new()
+    Local oRestVenda
+    Local nTamEmp   := If(!Empty(cEmpAnt), Len(cEmpAnt), 2)
+    Local nTamFil   := If(!Empty(cFilAnt), Len(cFilAnt), 2)
+    // verifica se é base teste ou produção para alterar endpoints
+    Local lBaseProducao := Upper(AllTrim(GetSrvProfString("dbalias", ""))) == "SIGAPROD"
+    Local cHost := ""
+    Local cEmailCad     := SuperGetMV("FC_MAILCAD", .F., "cadastro1@grupokhronos.com.br")
+    Local cEmailCpy     := "coordenador.cobranca@grupokhronos.com.br;daniel.scheeren@gruppe.com.br"
+
+	If lBaseProducao
+		// url de consulta base produção
+        cHost := "https://api.fpay.me"
+    
+        // cabeçalho de requisição
+        aAdd(aHeaderCEN, "Content-Type: application/json")
+        aAdd(aHeaderCEN, "Client-Code: " + CLIENT_CODE_FC_CEN)
+        aAdd(aHeaderCEN, "Client-key: " + TOKEN_FC_CEN)
+
+        aAdd(aHeaderKME, "Content-Type: application/json")
+        aAdd(aHeaderKME, "Client-Code: " + CLIENT_CODE_FC_KME)
+        aAdd(aHeaderKME, "Client-key: " + TOKEN_FC_KME)
+        
+        aAdd(aHeaderKSP, "Content-Type: application/json")
+        aAdd(aHeaderKSP, "Client-Code: " + CLIENT_CODE_FC_KSP)
+        aAdd(aHeaderKSP, "Client-key: " + TOKEN_FC_KSP)
+
+	Else
+		// url de consulta base teste
+		cHost := "https://api-sandbox.fpay.me"
+    
+        aAdd(aHeaderSandBox, "Content-Type: application/json")
+        aAdd(aHeaderSandBox, "Client-Code: " + CLIENT_CODE_FC_SANDBOX)
+        aAdd(aHeaderSandBox, "Client-key: " + TOKEN_FC_SANDBOX)
+
+	EndIf
+
+
+    // grava dados do body recebido
+    jBody:FromJson(oRest:GetBodyRequest())
+
+    varinfo("body_captura_cc", jBody:ToJson())
+
+    // validações
+    If ( jBody:ToJson() != "{}" )
+
+        // ----- busca a chave para identificação do título
+        // valida se recebeu o código identificador do título
+        If jBody:HasProperty("nu_referencia")
+
+            // chave de referência contendo os dados da empresa e titulo
+            If At(".", jBody["nu_referencia"]) > 0
+                cChaveRef    := AllTrim(SubStr(jBody["nu_referencia"], 1, At(".", jBody["nu_referencia"])-1))   // remove o ".0" ao final que se trata de um contador da venda via link, pois a Fast permite mais de uma venda por link
+            Else
+                cChaveRef    := AllTrim(jBody["nu_referencia"])
+            EndIf
+
+        // valida se recebeu o código identificador da venda
+        ElseIf jBody:HasProperty("fid")
+
+            // endereço da integração
+        	oRestVenda 	 := FWRest():New(cHost)
+
+            // path consutla credito
+            oRestVenda:SetPath(WS_ENDPOINT_ID_CREDITO + AllTrim(jBody['fid']))
+
+            oRestVenda:SetChkStatus(.T.)
+
+            // tenta efetuar o Get
+            If (lBaseProducao .and. (oRestVenda:Get(aHeaderCEN) .or. oRestVenda:Get(aHeaderKME) .or. oRestVenda:Get(aHeaderKSP))) ;   // base de produção
+                .or. (!lBaseProducao .and. oRestVenda:Get(aHeaderSandBox))  // base de testes
+
+                jJsonCredito := JsonObject():New()
+
+                // resgata a resposta do JSON
+                jJsonCredito:FromJson(DecodeUTF8(oRestVenda:GetResult()))
+
+                jJsonCredito := jJsonCredito['data']
+
+                // chave de referência contendo os dados da empresa e titulo
+                cChaveRef    := AllTrim(SubStr(jJsonCredito["nu_referencia"], 1, At(".", jJsonCredito["nu_referencia"])-1))   // remove o ".0" ao final que se trata de um contador da venda via link, pois a Fast permite mais de uma venda por link
+                
+            Else
+                lRet                 := .F.
+                cCodErro             := 400 // Bad Request
+                jResponse["message"] := "Não foi possível encontrar a venda. - " + AllTrim(jBody['fid'])
+            EndIf
+
+        Else
+            lRet                 := .F.
+            cCodErro             := 400 // Bad Request
+            jResponse["message"] := "Não foi identificado campo FID ou NU_REFERENCIA para idenficiação do título."
+        EndIf
+
+        
+        // grava os dados de retorno
+        If lRet
+            
+            // dados da empresa
+            _cEmpresa := SubStr(cChaveRef, 1, nTamEmp)
+            _cFilial  := SubStr(cChaveRef, nTamEmp+1, nTamFil)
+            
+            // atualiza chave, removendo dados da empresa
+            cChave    := SubStr(cChaveRef, (nTamEmp + nTamFil + 1))
+
+            // prepara ambiente
+            RpcClearEnv()
+            RpcSetType(3)
+            RpcSetEnv(_cEmpresa, _cFilial,,, "FIN",,,,,,)
+
+            // separa os dados do título
+            nPos         := 1
+            // Num contrato
+            aDadosLog[1] := SubStr(cChave, nPos, TamSX3("ZC_NUM")[1])
+            nPos         += Len(aDadosLog[1])
+            // Cliente
+            aDadosLog[2] := SubStr(cChave, nPos, TamSX3("ZC_CLIENT")[1])
+            nPos         += Len(aDadosLog[2])
+            // Loja
+            aDadosLog[3] := SubStr(cChave, nPos, TamSX3("ZC_LOJA")[1])
+            nPos         += Len(aDadosLog[3])
+
+            If jBody:HasProperty("categoria")
+
+                // categoria do retorno
+                cCategoria := jBody["categoria"]
+                
+                Do Case
+
+                    // quando a captura é efetuada com sucesso
+                    Case cCategoria == "credito.sucesso" .or. cCategoria == "link.sucesso" .or. cCategoria == "link.validacao.sucesso"
+
+                        cStatus := "A"
+
+                        // busca o título
+                        DbSelectArea("SZC")
+                        SZC->(DbSetOrder(1))	// 1 - ZC_FILIAL, ZC_NUM
+                        If SZC->(DbSeek(FWxFilial("SZC") + aDadosLog[1]))
+
+                            RecLock("SZC", .F.)
+                                SZC->ZC_STATUSC := cStatus  // A=Cartão de crédito aprovado
+                            SZC->(MsUnlock())
+
+                            If jBody:HasProperty("ds_cartao_token")
+                                // grava token do cartão para futuros envios
+                                DbSelectArea("SA1")
+                                SA1->(DbSetOrder(1))	// 1- A1_FILIAL, A1_COD, A1_LOJA
+                                If SA1->(DbSeek(FWxFilial("SA1") + aDadosLog[2] + aDadosLog[3]))
+                                    RecLock("SA1", .F.)
+                                        SA1->A1_ZCCTOKE := AllTrim(DecodeUTF8(jBody["ds_cartao_token"]))	// token do cartão utilizado para não necessitar passar os dados do cartão a cada integração
+                                    SA1->(MsUnlock())
+                                EndIf
+                            EndIf
+                            
+                            // envia e-mail de sucesso
+                            MailCliCC(cEmailCad, cEmailCpy, SA1->A1_NOME, cStatus, jBody['url_link'])
+                            
+                            // grava log de captura
+                            U_FCLogCap(aDadosLog, "Captura de cartão de crédito aprovada.", cStatus, "", jBody:ToJson(), "")
+
+                        Else
+                            // grava log de captura
+                            U_FCLogCap(aDadosLog, "Captura de cartão de crédito aprovada, porém não encontrado contrato " + aDadosLog[1] + ".", cStatus, "", jBody:ToJson(), "")
+                        EndIf
+
+                    // quando ocorre algum erro na transação
+                    Case cCategoria == "credito.erro" .or. cCategoria == "link.erro" .or. cCategoria == "link.validacao.erro"
+                        
+                        cStatus := "F"
+
+                        // busca o título
+                        DbSelectArea("SZC")
+                        SZC->(DbSetOrder(1))	// 1 - ZC_FILIAL, ZC_NUM
+                        If SZC->(DbSeek(FWxFilial("SZC") + aDadosLog[1]))
+
+                            RecLock("SZC", .F.)
+                                SZC->ZC_STATUSC := cStatus  // F=Cartão de crédito não aprovado
+                            SZC->(MsUnlock())
+                            
+                            // grava log de captura
+                            U_FCLogCap(aDadosLog, "Captura de cartão de crédito não aprovada.", cStatus, "", jBody:ToJson(), "")
+                            
+                            // envia e-mail do erro
+                            MailCliCC(cEmailCad, cEmailCpy, SA1->A1_NOME, cStatus, "", If(jBody:HasProperty('ds_mensagem'), jBody['ds_mensagem'], ""))
+
+                        Else
+                            // grava log de captura
+                            U_FCLogCap(aDadosLog, "Captura de cartão de crédito não aprovada e não encontrado contrato " + aDadosLog[1] + ".", cStatus, "", jBody:ToJson(), "")
+                        EndIf
+
+                    Otherwise
+                    
+                EndCase
+
+                // mensagem de retorno sucesso
+                If jBody:HasProperty("situacao")
+                    // jResponse["message"] := "Sucesso ao receber o retorno. Categoria: '" + cCategoria + "' e situação: '" + Upper(jBody["situacao"]) + "'."
+                    conout(jBody:ToJson())
+                    jResponse["message"] := "Sucesso ao receber o retorno." + If(cCategoria != Nil, "Categoria: '" + cCategoria + "'.", "")
+                Else
+                    jResponse["message"] := "Sucesso ao receber o retorno. Categoria: '" + cCategoria + "'."
+                EndIf
+
+            Else
+                lRet                 := .F.
+                cCodErro             := 400 // Bad Request
+                jResponse["message"] := "Não foi possível identificar a variável 'categoria'."
+                // grava log
+                U_FCLogCap(aDadosLog, "Erro no recebimento do webhook de captura.", "E", "", "", jResponse["message"])
+            EndIf
+        EndIf
+
+        // grava retorno
+        If lRet
+            // grava log
+            // U_FCLog("CC", aDadosLog, "Sucesso no retorno da cobrança de crédito.", "S", "", jBody, "")
+        Else
+            // grava log
+            // U_FCLog("CC", aDadosLog, "Erro no recebimento do pagamento via crédito.", "E", "", jBody, jResponse["message"])
+            Conout("WSRESTRETORNOFASTCONNECT - Erro no recebimento do webhook de captura: " + jResponse["message"])
+        EndIf
+
+        // grava log
+        // U_FCLog("CC", {"","","","","",""}, "Fim - Recebido retorno do pagamento via crédito.")
+        Conout("WSRESTRETORNOFASTCONNECT - Recebido retorno do webhook de captura de cartão de crédito.")
+        
+
+    Else
+        lRet                 := .F.
+        cCodErro             := 400 // Bad Request
+        jResponse["message"] := "Não foi possível ler o conteúdo do body."
+    EndIf
+    
+    // se ocorreu erro grava no console
+    If !lRet .and. jResponse:HasProperty("message")
+        Conout("WSRESTRETORNOFASTCONNECT - " + jResponse["message"] + " - " + jBody:ToJson() + ".")
+    EndIf
+
+
+    // atualiza status de retorno
+    jResponse["success"] := lRet
+    // status code
+    oRest:SetStatusCode(cCodErro)
+
+    // retorno
+    oRest:SetResponse( jResponse:ToJson() )
+
+    // TODO acompanhamento inicial via email
+    // prepara ambiente
+    RpcClearEnv()
+    RpcSetType(3)
+    RpcSetEnv("04", "01",,, "FIN",,,,,,)
+
+    EnviaEmail("Json recebimento de captura de cartão Fast Conenct", "daniel.scheeren@gruppe.com.br", "", jBody:ToJson())
+
+
+    RpcClearEnv()
+    
+Return .T.
+
+Static Function EnviaEmail(cSubject, cTo, cCC, cJson)
+
+	Local lOk     		:= .T.
+	Local cAccount 		:= AllTrim(SuperGetMV("MV_RELACNT" ,.F., "",cFilAnt))
+	Local cFrom			:= AllTrim(SuperGetMV("MV_RELFROM" ,.F., "",cFilAnt))
+	Local cPassword 	:= AllTrim(SuperGetMV("MV_RELPSW", .F., "",cFilAnt))
+	Local cSMTP			:= AllTrim(SuperGetMV("MV_RELSERV", .F., "",cFilAnt))
+	Local cUser 		:= AllTrim(SuperGetMV("MV_RELAUSR", .F., "",cFilAnt))
+	Local nTimeOut 		:= SuperGetMV("MV_RELTIME", .F., 30,cFilAnt)
+	Local lAuth			:= SuperGetMV("MV_RELAUTH", .F., .F.,cFilAnt)
+	Local lSSL			:= SuperGetMV("MV_RELSSL", .F., .F.,cFilAnt)
+	Local lTLS			:= SuperGetMV("MV_RELTLS", .F., .F.,cFilAnt)
+	Local nPort 		:= SuperGetMV("MV_PORSMTP", .F., 25,cFilAnt)
+	Local nError		:= 0
+	Local oMessage		:= Nil
+	Local oSMTP			:= Nil
+
+	Default cCC			:= ""
+	Default cSubject	:= "E-mail enviado via TOTVS Protheus"
+
+	cTo   := Alltrim(cTo)
+	cCC   := Alltrim(cCC)
+	cFrom := Alltrim(cFrom)
+    // monta HTML
+    cBody := cJson
+
+    oSMTP := TMailManager():New()
+
+    // Quando for informado a porta, separa do endereço.
+    If At(':', cSMTP) > 0
+        nPort := Val(SubStr(cSMTP, At(':', cSMTP) + 1))
+        cSMTP := SubStr(cSMTP, 1, At(':', cSMTP) - 1)
+    EndIf
+
+    If nPort == 465 .And. lSSL == .F.
+        lSSL := .T.
+    ElseIf nPort == 587 .And. lTLS == .F.
+        lTLS := .T.
+    EndIf
+
+    oSMTP:SetUseSSL(lSSL)
+    oSMTP:SetUseTLS(lTLS)
+
+    If (nPosAt := At('@', cAccount)) > 0
+        cAccount := SubStr(cAccount, 1, nPosAt - 1)
+    Endif
+
+    Begin Sequence
+        // Configura dados para conexão.
+        If (nError := oSMTP:Init("", cSMTP, cAccount, cPassword, , nPort)) != 0
+            Break
+        EndIf
+
+        // Seta o TimeOut(em segundos) para conexao baseado no parametro MV_RELTIME.
+        oSMTP:SetSMTPTimeOut(nTimeOut)
+
+        // Conecta ao servidor SMTP.
+        If (nError := oSMTP:SMTPConnect()) != 0
+            Break
+        EndIf
+
+        // Autentica se houver a necessidade.
+        If lAuth .And. (nError := oSMTP:SMTPAuth(cUser, cPassword)) != 0
+            Break
+        EndIf
+
+        // Inicia objeto de mensagem de e-mail.
+        oMessage := TMailMessage():New()
+        oMessage:cFrom := cFrom
+        oMessage:cTo := cTo
+        oMessage:cCc := cCC
+        oMessage:cSubject := cSubject
+        oMessage:cBody := cBody
+
+        // Realiza o envio da mensagem.
+        If (nError := oMessage:Send(oSMTP)) != 0
+            Break
+        EndIf
+    Recover
+        If !IsBlind()
+            ShowHelpDlg("ErrMail", {"Erro ao realizar o envio do e-mail: ", oSMTP:GetErrorString(nError)}, 2, {"Verifique as informações"}, 1)
+        EndIf
+        lOk := .F.
+    End Sequence
+
+    oSMTP:SMTPDisconnect()
+
+    FreeObj(oSMTP)
+    FreeObj(oMessage)
+
+Return lOk
+
+
+/*/{Protheus.doc} MailCliCC
+	Envio de e-mail com as informações de retorno da captura de cartão de crédito
+    @type function
+	@version 1.0
+	@author Daniel Scheeren - Gruppe
+	@since 02/06/2022
+	@param cEmailCli, character, E-mail do cliente
+	@param cNomeCli, character, Nome do cliente
+	@param nParcela, numeric, Numero da parcela
+	@param nTotParcelas, numeric, Numero total de parcelas
+	@param nVlrVenda, numeric, Valor da parcela
+	@param cLinkCaptura, character, Link de pagamento
+	@return variant, return_description
+	/*/
+Static Function MailCliCC(cEmailCad, cEmailCpy, cNomeCli, cStatus, cLinkCaptura, cErro)
+
+    Local oProcess, oHtml
+	// Local cTelefoneContato := SuperGetMV("FC_CONTTEL", .F., "")
+	// Local cEmailContato    := SuperGetMV("FC_CONTEML", .F., "")
+	Local cLogoEmpresa	:= SuperGetMV("FC_EMPLOGO", .F., "https://static.fastconnect.com.br/clients/1/images/emails/fast-logo-h-500.png.png")
+	// Local cLogoFast 	   := SuperGetMV("FC_FSTLOGO", .F., "https://static.fastconnect.com.br/clients/1/images/emails/fast-logo-500x175.png.png")
+	// Local aDadosFilial 	   := FWArrFilAtu(cEmpAnt, cFilAnt)
+	// Local cNomeFantasia    := EncodeUtf8(Upper(AllTrim(aDadosFilial[17])))
+	// verifica se é base teste ou produção para alterar endpoints
+    Local lBaseProducao := Upper(AllTrim(GetSrvProfString("dbalias", ""))) == "SIGAPROD"
+    Local cEmail        := ""
+
+    Default cErro := ""
+
+    cAssunto := "Captura de cartão de crédito - " + AllTrim(cNomeCli)
+
+    // dados do envio
+	If lBaseProducao
+    	cEmail    	:= cEmailCad + cEmailCpy
+	Else
+    	cEmail    	:= UsrRetMail(RetCodUsr()) + cEmailCpy
+	EndIf
+    aToMails := StrTokArr(cEmail,";")
+    cBody := ""
+
+    oFile := FWFileReader():New("\workflow\fastconnect\WFFastRetornoCapturaCC.html")
+    If oFile:Open()
+    
+        If ! (oFile:EoF())
+            cBody := oFile:FullRead()
+        EndIf
+        
+        oFile:Close()
+    EndIf
+
+
+    // substitui dados do arquivo
+    cBody := StrTran(cBody, "%cNomeCliente%", AllTrim(cNomeCli))
+    cBody := StrTran(cBody, "%cStatus%",  If(cStatus == "A", "APROVADA", "NEAGADA"))
+    cBody := StrTran(cBody, "%cStatusDesc%",  If(cStatus == "A", "Captura de cartão de crédito foi aprovada com sucesso.", "Falha na captura de cartão de crédito: " + cErro))
+    cBody := StrTran(cBody, "%cLinkCaptura%", If(!Empty(cLinkCaptura), AllTrim(cLinkCaptura), "Link não gerado."))
+    cBody := StrTran(cBody, "//", "\/\/")
+
+    oMail := SendGrid():New()
+	oMail:SendMail(aToMails, cAssunto, FwCutOff(cBody, .F.), Nil, .F.)
+
+Return .T.
